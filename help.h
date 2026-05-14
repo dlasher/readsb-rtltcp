@@ -179,6 +179,10 @@ static struct argp_option optionsReadsb[] = {
     {"device", OptDevice, "<index|serial>", 0, "Select device by index or serial number", 3},
     {"enable-agc", OptRtlSdrEnableAgc, 0, 0, "Enable digital AGC (not tuner AGC!)", 3},
     {"ppm", OptRtlSdrPpm, "<correction>", 0, "Set oscillator frequency correction in PPM", 3},
+    {"device", OptDevice, "<rtl_tcp:host:port|index|serial>", 0, "Select device: 'rtl_tcp:host:port' for TCP remote, or index/serial for local USB", 3},
+    {"rtltcp-direct-samp", OptRtlTcpDirectSamp, "<mode>", 0, "Set direct sampling mode (0=off, 1=I-ADC, 2=Q-ADC) for rtl_tcp", 3},
+    {"rtltcp-offset-tune", OptRtlTcpOffsetTune, "<0|1>", 0, "Enable offset tuning for rtl_tcp", 3},
+    {"rtltcp-bias-tee", OptRtlTcpBiasTee, "<0|1>", 0, "Enable bias-T on GPIO PIN 0 for rtl_tcp (works for rtl-sdr.com v3 dongles)", 3},
 #endif
 #ifdef ENABLE_BLADERF
     {0,0,0,0, "BladeRF options:", 4},

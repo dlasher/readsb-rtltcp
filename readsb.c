@@ -2371,6 +2371,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 #ifdef ENABLE_RTLSDR
         case OptRtlSdrEnableAgc:
         case OptRtlSdrPpm:
+        case OptRtlTcpDirectSamp:
+        case OptRtlTcpOffsetTune:
+        case OptRtlTcpBiasTee:
 #endif
         case OptBeastSerial:
         case OptBeastBaudrate:

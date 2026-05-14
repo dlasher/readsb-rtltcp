@@ -1386,6 +1386,9 @@ enum {
     OptSoapyBandwith,
     OptSoapyEnableAgc,
     OptSoapyGainElement,
+    OptRtlTcpDirectSamp,
+    OptRtlTcpOffsetTune,
+    OptRtlTcpBiasTee,
 };
 
 
