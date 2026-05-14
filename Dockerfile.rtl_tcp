@@ -42,8 +42,12 @@ COPY --from=builder /usr/local/bin/readsb* /usr/local/bin/
 COPY --from=builder /usr/local/bin/viewadsb* /usr/local/bin/
 COPY --from=builder /usr/local/share/tar1090/aircraft.csv.gz /usr/local/share/tar1090/aircraft.csv.gz
 COPY --from=builder /usr/local/lib/libjemalloc.so.2 /usr/local/lib/libjemalloc.so.2
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENV LD_PRELOAD=/usr/local/lib/libjemalloc.so.2
 ENV MALLOC_CONF=narenas:1,tcache:false
 
-ENTRYPOINT ["/usr/local/bin/readsb"]
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD []
