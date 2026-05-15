@@ -404,12 +404,13 @@ struct char_buffer readWholeGz(gzFile gzfp, char *errorContext) {
         if (toRead == 0) {
             alloc *= 2;
             char *oldBuffer = cb.buffer;
-            cb.buffer = realloc(cb.buffer, alloc);
-            if (!cb.buffer) {
+            void *tmp = realloc(cb.buffer, alloc);
+            if (!tmp) {
                 sfree(oldBuffer);
                 fprintf(stderr, "reading %s: readWholeGz alloc fail!\n", errorContext);
                 return (struct char_buffer) {0};
             }
+            cb.buffer = tmp;
             toRead = alloc - cb.len;
         }
     }

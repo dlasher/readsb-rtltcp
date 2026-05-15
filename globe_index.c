@@ -1664,11 +1664,17 @@ void ca_add (struct craftArray *ca, struct aircraft *a) {
         pthread_mutex_lock(&ca->write_mutex);
         if (ca->len == ca->alloc) {
             ca->alloc = ca->alloc * 2 + 16;
-            ca->list = realloc(ca->list, ca->alloc * sizeof(struct aircraft *));
-            if (!ca->list) {
+            struct aircraft **new_list = realloc(ca->list, ca->alloc * sizeof(struct aircraft *));
+            if (!new_list) {
                 fprintf(stderr, "ca_add(): out of memory!\n");
-                exit(1);
+                pthread_mutex_unlock(&ca->write_mutex);
+                pthread_mutex_unlock(&ca->change_mutex);
+                return;
             }
+            ca->list = new_list;
+        }
+        pthread_mutex_unlock(&ca->write_mutex);
+    }
         }
         pthread_mutex_unlock(&ca->write_mutex);
     }

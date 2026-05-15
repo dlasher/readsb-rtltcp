@@ -1183,7 +1183,8 @@ static void modesAcceptClients(struct client *c, int64_t now) {
 
         c = createSocketClient(s, fd, NULL);
         if (s->unixSocket && c) {
-            strcpy(c->host, s->unixSocket);
+            strncpy(c->host, s->unixSocket, sizeof(c->host) - 1);
+            c->host[sizeof(c->host) - 1] = '\0';
             fprintf(stderr, "%s: new c at %s\n", c->service->descr, s->unixSocket);
         } else if (c) {
             // We created the client, save the sockaddr info and 'hostport'
@@ -3789,7 +3790,7 @@ static int handle_gpsd(struct client *c, char *p, int remote, int64_t now, struc
     struct char_buffer msg;
     msg.alloc = strlen(p) + 128;
     msg.buffer = cmalloc(msg.alloc);
-    sprintf(msg.buffer, "%s\n", p);
+    snprintf(msg.buffer, msg.alloc, "%s\n", p);
     msg.len = strlen(msg.buffer);
 
     // remove spaces in place

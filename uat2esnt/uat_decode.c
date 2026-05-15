@@ -837,7 +837,12 @@ static void uat_display_fisb_frame(const struct fisb_apdu *apdu, FILE *to)
                     report_buf[next_report - report] = 0;
                     report = next_report + 1;
                 } else {
-                    strcpy(report_buf, report);
+                    size_t report_len = strlen(report);
+                    if (report_len >= sizeof(report_buf)) {
+                        report_len = sizeof(report_buf) - 1;
+                    }
+                    memcpy(report_buf, report, report_len);
+                    report_buf[report_len] = '\0';
                     report = NULL;
                 }
                 

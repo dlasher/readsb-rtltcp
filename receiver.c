@@ -386,7 +386,13 @@ struct char_buffer generateReceiversJson() {
                 if ((p + 1000) >= end) {
                     int used = p - buf;
                     buflen *= 2;
+                    char *old_buf = buf;
                     buf = (char *) realloc(buf, buflen);
+                    if (!buf) {
+                        sfree(old_buf);
+                        fprintf(stderr, "receiver.c: realloc failed\n");
+                        return;
+                    }
                     p = buf + used;
                     end = buf + buflen;
                 }

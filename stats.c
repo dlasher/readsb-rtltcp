@@ -991,7 +991,13 @@ void statsCountAircraft(int64_t now) {
                 ) && signal > -49.4 && signal < 1) {
                 if (s->rssi_table_alloc < s->rssi_table_len + 1) {
                     s->rssi_table_alloc = 2 * s->rssi_table_len + 1024;
+                    float *old_table = s->rssi_table;
                     s->rssi_table = realloc(s->rssi_table, sizeof(float) * s->rssi_table_alloc);
+                    if (!s->rssi_table) {
+                        sfree(old_table);
+                        fprintf(stderr, "stats.c: realloc failed\n");
+                        return;
+                    }
                 }
                 s->rssi_table[s->rssi_table_len] = signal;
                 s->rssi_table_len++;

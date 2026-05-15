@@ -1621,10 +1621,26 @@ static void apiReadRequest(struct apiCon *con, struct apiThread *thread) {
     }
     if (!request->alloc) {
         request->alloc = 2048;
-        request->buffer = realloc(request->buffer, request->alloc);
+        void *tmp = realloc(request->buffer, request->alloc);
+        if (!tmp) {
+            fprintf(stderr, "FATAL: apiReadRequest realloc failed\n");
+            setExit(2);
+            send503(con->fd, con->keepalive);
+            apiCloseCon(con, thread);
+            return;
+        }
+        request->buffer = tmp;
     } else if (request->len + end_pad + 512 > request->alloc) {
         request->alloc = requestMax;
-        request->buffer = realloc(request->buffer, request->alloc);
+        void *tmp = realloc(request->buffer, request->alloc);
+        if (!tmp) {
+            fprintf(stderr, "FATAL: apiReadRequest realloc failed\n");
+            setExit(2);
+            send503(con->fd, con->keepalive);
+            apiCloseCon(con, thread);
+            return;
+        }
+        request->buffer = tmp;
     }
     if (!request->buffer) {
         fprintf(stderr, "FATAL: apiReadRequest request->buffer malloc fail\n");
@@ -1749,7 +1765,7 @@ static void apiReadRequest(struct apiCon *con, struct apiThread *thread) {
 
     char *status = protocol - litLen("?status ");
     if (status > req_start && byteMatchStart(status, "?status ")) {
-        if (Modes.exitSoon) {
+        if (atomic_load(&Modes.exitSoon)) {
             send503(con->fd, con->keepalive);
         } else {
             send200(con->fd, con->keepalive);
