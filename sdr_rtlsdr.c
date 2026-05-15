@@ -667,6 +667,19 @@ void rtlsdrClose() {
     free(RTLSDR.rtl_tcp_host);
     RTLSDR.rtl_tcp_host = NULL;
 }
+    if (RTLSDR.converter) {
+        cleanup_converter(&RTLSDR.converter_state);
+        RTLSDR.converter = NULL;
+    }
+    free(RTLSDR.gains);
+    RTLSDR.gains = NULL;
+    free(RTLSDR.bounce_buffer);
+    RTLSDR.bounce_buffer = NULL;
+    free(RTLSDR.rtl_tcp_buffer);
+    RTLSDR.rtl_tcp_buffer = NULL;
+    free(RTLSDR.rtl_tcp_host);
+    RTLSDR.rtl_tcp_host = NULL;
+}
     if (RTLSDR.dev) {
         rtlsdr_close(RTLSDR.dev);
         RTLSDR.dev = NULL;
