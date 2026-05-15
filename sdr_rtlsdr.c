@@ -163,17 +163,21 @@ static int getClosestGainIndex(int target) {
 
 void rtlsdrSetGain(char *reason) {
     if (RTLSDR.rtl_tcp_mode) {
-        if (RTLSDR.rtl_tcp_socket < 0) return;
+        int sock;
+        pthread_mutex_lock(&Modes.sdrControlMutex);
+        sock = RTLSDR.rtl_tcp_socket;
+        pthread_mutex_unlock(&Modes.sdrControlMutex);
+        if (sock < 0) return;
         if (Modes.gain < 0) Modes.gain = 0;
         if (Modes.gain == MODES_AUTO_GAIN || Modes.gain >= 520) {
             RTLSDR.tunerAgcEnabled = 1;
             if (!Modes.gainQuiet) fprintf(stderr, "%srtl_tcp: tuner gain set to automatic\n", reason);
-            rtltcp_send_command(RTLSDR.rtl_tcp_socket, RTLTCP_SET_GAIN_MODE, 0);
+            rtltcp_send_command(sock, RTLTCP_SET_GAIN_MODE, 0);
         } else {
             RTLSDR.tunerAgcEnabled = 0;
             if (!Modes.gainQuiet) fprintf(stderr, "%srtl_tcp: tuner gain set to %.1f dB\n", reason, Modes.gain / 10.0);
-            rtltcp_send_command(RTLSDR.rtl_tcp_socket, RTLTCP_SET_GAIN_MODE, 1);
-            rtltcp_send_command(RTLSDR.rtl_tcp_socket, RTLTCP_SET_GAIN, (unsigned int)Modes.gain);
+            rtltcp_send_command(sock, RTLTCP_SET_GAIN_MODE, 1);
+            rtltcp_send_command(sock, RTLTCP_SET_GAIN, (unsigned int)Modes.gain);
         }
         return;
     }
@@ -385,14 +389,25 @@ static void *rtltcp_read_thread(void *arg) {
         RTLSDR.rtl_tcp_buffer = cmalloc(Modes.sdr_buf_size);
         if (!RTLSDR.rtl_tcp_buffer) { fprintf(stderr, "FATAL: rtl_tcp: can't allocate TCP read buffer\n"); return NULL; }
     }
-    while (!Modes.exit) {
-        ssize_t received = recv(RTLSDR.rtl_tcp_socket, (char*)RTLSDR.rtl_tcp_buffer, Modes.sdr_buf_size, MSG_WAITALL);
+    while (!atomic_load(&Modes.exit)) {
+        int sock;
+        pthread_mutex_lock(&Modes.sdrControlMutex);
+        sock = RTLSDR.rtl_tcp_socket;
+        pthread_mutex_unlock(&Modes.sdrControlMutex);
+        if (sock < 0) {
+            // Socket not ready, sleep a bit
+            usleep(100000);
+            continue;
+        }
+        ssize_t received = recv(sock, (char*)RTLSDR.rtl_tcp_buffer, Modes.sdr_buf_size, MSG_WAITALL);
         if (received <= 0) {
-            if (Modes.exit) break;
+            if (atomic_load(&Modes.exit)) break;
             fprintf(stderr, "rtl_tcp: %s\n", received == 0 ? "connection closed by server" : strerror(errno));
+            pthread_mutex_lock(&Modes.sdrControlMutex);
             close(RTLSDR.rtl_tcp_socket);
             RTLSDR.rtl_tcp_socket = -1;
-            while (!Modes.exit) {
+            pthread_mutex_unlock(&Modes.sdrControlMutex);
+            while (!atomic_load(&Modes.exit)) {
                 fprintf(stderr, "rtl_tcp: attempting to reconnect...\n");
                 if (rtltcp_do_connect(RTLSDR.rtl_tcp_host, RTLSDR.rtl_tcp_port)) {
                     rtltcp_send_config(RTLSDR.rtl_tcp_socket);
@@ -603,7 +618,11 @@ void rtlsdrRun() {
 
 void rtlsdrCancel() {
     if (RTLSDR.rtl_tcp_mode) {
-        if (RTLSDR.rtl_tcp_socket >= 0) shutdown(RTLSDR.rtl_tcp_socket, SHUT_RDWR);
+        int sock;
+        pthread_mutex_lock(&Modes.sdrControlMutex);
+        sock = RTLSDR.rtl_tcp_socket;
+        if (sock >= 0) shutdown(sock, SHUT_RDWR);
+        pthread_mutex_unlock(&Modes.sdrControlMutex);
         return;
     }
     rtlsdr_cancel_async(RTLSDR.dev);
@@ -611,13 +630,43 @@ void rtlsdrCancel() {
 
 void rtlsdrClose() {
     if (RTLSDR.rtl_tcp_mode) {
+        int sock = -1;
+        pthread_mutex_lock(&Modes.sdrControlMutex);
         if (RTLSDR.rtl_tcp_socket >= 0) {
-            shutdown(RTLSDR.rtl_tcp_socket, SHUT_RDWR);
-            close(RTLSDR.rtl_tcp_socket);
+            sock = RTLSDR.rtl_tcp_socket;
             RTLSDR.rtl_tcp_socket = -1;
         }
         RTLSDR.rtl_tcp_mode = false;
+        pthread_mutex_unlock(&Modes.sdrControlMutex);
+        if (sock >= 0) {
+            shutdown(sock, SHUT_RDWR);
+            close(sock);
+        }
     }
+    if (RTLSDR.dev) {
+        rtlsdr_close(RTLSDR.dev);
+        RTLSDR.dev = NULL;
+    }
+}
+        RTLSDR.rtl_tcp_mode = false;
+    }
+    if (RTLSDR.dev) {
+        rtlsdr_close(RTLSDR.dev);
+        RTLSDR.dev = NULL;
+    }
+    if (RTLSDR.converter) {
+        cleanup_converter(&RTLSDR.converter_state);
+        RTLSDR.converter = NULL;
+    }
+    free(RTLSDR.gains);
+    RTLSDR.gains = NULL;
+    free(RTLSDR.bounce_buffer);
+    RTLSDR.bounce_buffer = NULL;
+    free(RTLSDR.rtl_tcp_buffer);
+    RTLSDR.rtl_tcp_buffer = NULL;
+    free(RTLSDR.rtl_tcp_host);
+    RTLSDR.rtl_tcp_host = NULL;
+}
     if (RTLSDR.dev) {
         rtlsdr_close(RTLSDR.dev);
         RTLSDR.dev = NULL;
