@@ -649,6 +649,7 @@ struct _Modes
     pthread_mutex_t aircraftBackMutex;
     pthread_mutex_t aircraftLoadMutex;
     pthread_mutex_t aircraftCreateMutex;
+    pthread_mutex_t *aircraftLocks;
     atomic_int aircraftBackSpinlock;
 
     struct craftArray *globeLists;

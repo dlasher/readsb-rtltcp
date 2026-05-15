@@ -279,15 +279,18 @@ struct aircraft *aircraftCreate(uint32_t addr) {
     updateTypeReg(a);
 
     uint32_t hash = aircraftHash(addr);
-
-    // this isn't needed as this happens on separate areas of the hashtable when it's called in
-    // parallel
-    //pthread_mutex_lock(&Modes.aircraftCreateMutex);
+    // Hash table insertion with bucket-level locking
+    pthread_mutex_lock(&Modes.aircraftCreateMutex);
+    if (Modes.aircraftLocks) {
+        pthread_mutex_lock(&Modes.aircraftLocks[hash]);
+    }
 
     a->next = Modes.aircraft[hash];
     Modes.aircraft[hash] = a;
-
-    //pthread_mutex_unlock(&Modes.aircraftCreateMutex);
+    pthread_mutex_unlock(&Modes.aircraftCreateMutex);
+    if (Modes.aircraftLocks) {
+        pthread_mutex_unlock(&Modes.aircraftLocks[hash]);
+    }
 
     return a;
 }
