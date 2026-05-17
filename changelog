@@ -2,6 +2,11 @@ readsb (3.16.16) stable; urgency=medium
 
   * security-fixes: Implement per-bucket locking for aircraft hash table to prevent race conditions
   * security-fixes: Change Modes.exit and Modes.exitSoon to atomic_int for proper thread signaling
+  * security-fixes: Fix RTL-TCP client thread safety with proper mutex protection
+  * security-fixes: Implement memory safety fixes for buffer overflows and unsafe string handling
+  * security-fixes: Add interruptible shutdown mechanism for RTL-TCP client
+  * security-fixes: Implement robust I/O management with timeouts and keepalive
+  * security-fixes: Add exponential backoff and circuit breaker for reconnect delays
 
   -- Automated Security Fix <security@example.com>  Fri, 15 May 2026 14:45:00 +0000
 

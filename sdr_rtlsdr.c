@@ -65,6 +65,8 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <time.h>
 
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(DISABLE_RTLSDR_ZEROCOPY_WORKAROUND)
 #  define USE_BOUNCE_BUFFER
@@ -83,6 +85,11 @@ typedef struct {
     uint32_t tuner_type;      // network byte order
     uint32_t tuner_gain_count; // network byte order
 } dongle_info_t;
+
+// Circuit breaker states
+#define CIRCUIT_CLOSED 0
+#define CIRCUIT_OPEN 1
+#define CIRCUIT_HALF_OPEN 2
 
 // RTL-TCP command codes
 #define RTLTCP_SET_FREQ           0x01
@@ -122,6 +129,11 @@ static struct {
     int direct_sampling;        // rtl_tcp: direct sampling mode
     int offset_tuning;          // rtl_tcp: offset tuning
     int bias_tee;               // rtl_tcp: bias tee (0 or 1)
+    // Circuit breaker state tracking
+    int circuit_state;          // Current circuit breaker state
+    int failure_count;         // Number of consecutive failures
+    time_t last_failure_time;   // Time of last failure
+    int circuit_reset_timeout; // Timeout before trying to reconnect in half-open state
 } RTLSDR;
 
 // Forward declarations for functions used before definition
@@ -142,12 +154,18 @@ void rtlsdrInitConfig() {
     // rtl_tcp initialization
     RTLSDR.rtl_tcp_socket = -1;
     RTLSDR.rtl_tcp_mode = false;
+    RTLSDR.rtl_tcp_thread = 0;
     RTLSDR.rtl_tcp_buffer = NULL;
     RTLSDR.rtl_tcp_host = NULL;
     RTLSDR.rtl_tcp_port = 1234;
     RTLSDR.direct_sampling = 0;
     RTLSDR.offset_tuning = 0;
     RTLSDR.bias_tee = 0;
+    // Initialize circuit breaker state
+    RTLSDR.circuit_state = CIRCUIT_CLOSED;
+    RTLSDR.failure_count = 0;
+    RTLSDR.last_failure_time = 0;
+    RTLSDR.circuit_reset_timeout = 60; // 60 second timeout before half-open state
 }
 
 static int getClosestGainIndex(int target) {
@@ -332,10 +350,35 @@ static bool rtltcp_do_connect(const char *host, int port) {
     for (res = res0; res; res = res->ai_next) {
         sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (sock >= 0) {
+            // Set socket to non-blocking for connection timeout
+            int flags = fcntl(sock, F_GETFL, 0);
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+            
+            // Attempt connection
             ret = connect(sock, res->ai_addr, res->ai_addrlen);
-            if (ret == 0) break;
-            close(sock);
-            sock = -1;
+            if (ret == -1 && errno != EINPROGRESS) {
+                close(sock);
+                sock = -1;
+                continue;
+            }
+            
+            // If connection in progress, wait for it with timeout
+            if (ret == -1) {
+                fd_set fdset;
+                FD_ZERO(&fdset);
+                FD_SET(sock, &fdset);
+                struct timeval tv = {5, 0}; // 5 second timeout
+                int result = select(sock + 1, NULL, &fdset, NULL, &tv);
+                if (result <= 0) {
+                    close(sock);
+                    sock = -1;
+                    continue;
+                }
+            }
+            
+            // Set socket back to blocking mode
+            fcntl(sock, F_SETFL, flags);
+            break;
         }
     }
     freeaddrinfo(res0);
@@ -345,6 +388,17 @@ static bool rtltcp_do_connect(const char *host, int port) {
     }
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    
+    // Enable TCP keepalive to detect dead peers
+    int keepalive = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    
+    // Set socket timeout for detecting half-open connections
+    struct timeval timeout;
+    timeout.tv_sec = 10;  // 10 second timeout
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     dongle_info_t info;
     ssize_t received = recv(sock, (char*)&info, sizeof(info), 0);
@@ -358,7 +412,9 @@ static bool rtltcp_do_connect(const char *host, int port) {
         close(sock);
         return false;
     }
+    pthread_mutex_lock(&Modes.sdrControlMutex);
     RTLSDR.rtl_tcp_socket = sock;
+    pthread_mutex_unlock(&Modes.sdrControlMutex);
     uint32_t tuner_number = ntohl(info.tuner_type);
     uint32_t gain_count = ntohl(info.tuner_gain_count);
     const char *tuner_names[] = {"Unknown", "E4000", "FC0012", "FC0013", "FC2580", "R820T", "R828D"};
@@ -398,24 +454,60 @@ static void *rtltcp_read_thread(void *arg) {
             // Socket not ready, sleep a bit
             usleep(100000);
             continue;
-        }
-        ssize_t received = recv(sock, (char*)RTLSDR.rtl_tcp_buffer, Modes.sdr_buf_size, MSG_WAITALL);
+}
+        // Set socket timeout for non-blocking operation
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        ssize_t received = recv(sock, (char*)RTLSDR.rtl_tcp_buffer, Modes.sdr_buf_size, 0);
         if (received <= 0) {
-            if (atomic_load(&Modes.exit)) break;
-            fprintf(stderr, "rtl_tcp: %s\n", received == 0 ? "connection closed by server" : strerror(errno));
             pthread_mutex_lock(&Modes.sdrControlMutex);
             close(RTLSDR.rtl_tcp_socket);
             RTLSDR.rtl_tcp_socket = -1;
             pthread_mutex_unlock(&Modes.sdrControlMutex);
-            while (!atomic_load(&Modes.exit)) {
-                fprintf(stderr, "rtl_tcp: attempting to reconnect...\n");
+            int reconnect_delay = 1;  // Start with 1 second delay
+            int max_reconnect_delay = 60;  // Maximum 60 second delay
+            int retry_count = 0;
+            int max_retries = 10;  // Maximum number of reconnection attempts before giving up
+            
+while (!atomic_load(&Modes.exit) && retry_count < max_retries) {
+                retry_count++;
+                
+                // Check circuit breaker state
+                if (RTLSDR.circuit_state == CIRCUIT_OPEN) {
+                    time_t current_time = time(NULL);
+                    if (current_time - RTLSDR.last_failure_time > RTLSDR.circuit_reset_timeout) {
+                        RTLSDR.circuit_state = CIRCUIT_HALF_OPEN;
+                    } else {
+                        fprintf(stderr, "rtl_tcp: circuit breaker is open, skipping reconnect attempt\n");
+                        continue;
+                    }
+                }
+                
+                fprintf(stderr, "rtl_tcp: attempting to reconnect (attempt %d/%d)...\n", retry_count, max_retries);
                 if (rtltcp_do_connect(RTLSDR.rtl_tcp_host, RTLSDR.rtl_tcp_port)) {
                     rtltcp_send_config(RTLSDR.rtl_tcp_socket);
                     fprintf(stderr, "rtl_tcp: reconnected successfully\n");
+                    // Reset circuit breaker on successful connection
+                    RTLSDR.circuit_state = CIRCUIT_CLOSED;
+                    RTLSDR.failure_count = 0;
                     break;
                 }
-                fprintf(stderr, "rtl_tcp: reconnect failed, retrying in 5 seconds...\n");
-                sleep(5);
+                fprintf(stderr, "rtl_tcp: reconnect failed, retrying in %d seconds...\n", reconnect_delay);
+                sleep(reconnect_delay);
+                
+                // Exponential backoff with jitter: add randomization to prevent thundering herd
+                int jitter = rand() % (reconnect_delay / 2 + 1);  // Add up to 50% jitter
+                reconnect_delay = imin(reconnect_delay * 2, max_reconnect_delay) + jitter;
+                
+                // Update circuit breaker state based on failure
+                RTLSDR.failure_count++;
+                if (RTLSDR.failure_count >= 5) {  // Too many consecutive failures
+                    RTLSDR.circuit_state = CIRCUIT_OPEN;  // Open the circuit breaker
+                }
+                RTLSDR.last_failure_time = time(NULL);
             }
         } else {
             rtlsdrCallback(RTLSDR.rtl_tcp_buffer, (uint32_t)received, NULL);
@@ -605,7 +697,7 @@ void rtlsdrRun() {
     if (RTLSDR.rtl_tcp_mode) {
         start_cpu_timing(&rtlsdr_thread_cpu);
         pthread_create(&RTLSDR.rtl_tcp_thread, NULL, rtltcp_read_thread, NULL);
-        pthread_join(RTLSDR.rtl_tcp_thread, NULL);
+        // Remove the blocking pthread_join and make it non-blocking
         end_cpu_timing(&rtlsdr_thread_cpu, &Modes.reader_cpu_accumulator);
         return;
     }
@@ -647,16 +739,10 @@ void rtlsdrClose() {
         rtlsdr_close(RTLSDR.dev);
         RTLSDR.dev = NULL;
     }
-}
-        RTLSDR.rtl_tcp_mode = false;
-    }
-    if (RTLSDR.dev) {
-        rtlsdr_close(RTLSDR.dev);
-        RTLSDR.dev = NULL;
-    }
-    if (RTLSDR.converter) {
-        cleanup_converter(&RTLSDR.converter_state);
-        RTLSDR.converter = NULL;
+    // Clean up RTL-TCP thread if it was created
+    if (RTLSDR.rtl_tcp_thread != 0) {
+        pthread_join(RTLSDR.rtl_tcp_thread, NULL);
+        RTLSDR.rtl_tcp_thread = 0;
     }
     free(RTLSDR.gains);
     RTLSDR.gains = NULL;
@@ -666,34 +752,8 @@ void rtlsdrClose() {
     RTLSDR.rtl_tcp_buffer = NULL;
     free(RTLSDR.rtl_tcp_host);
     RTLSDR.rtl_tcp_host = NULL;
-}
     if (RTLSDR.converter) {
         cleanup_converter(&RTLSDR.converter_state);
         RTLSDR.converter = NULL;
     }
-    free(RTLSDR.gains);
-    RTLSDR.gains = NULL;
-    free(RTLSDR.bounce_buffer);
-    RTLSDR.bounce_buffer = NULL;
-    free(RTLSDR.rtl_tcp_buffer);
-    RTLSDR.rtl_tcp_buffer = NULL;
-    free(RTLSDR.rtl_tcp_host);
-    RTLSDR.rtl_tcp_host = NULL;
-}
-    if (RTLSDR.dev) {
-        rtlsdr_close(RTLSDR.dev);
-        RTLSDR.dev = NULL;
-    }
-    if (RTLSDR.converter) {
-        cleanup_converter(&RTLSDR.converter_state);
-        RTLSDR.converter = NULL;
-    }
-    free(RTLSDR.gains);
-    RTLSDR.gains = NULL;
-    free(RTLSDR.bounce_buffer);
-    RTLSDR.bounce_buffer = NULL;
-    free(RTLSDR.rtl_tcp_buffer);
-    RTLSDR.rtl_tcp_buffer = NULL;
-    free(RTLSDR.rtl_tcp_host);
-    RTLSDR.rtl_tcp_host = NULL;
 }
