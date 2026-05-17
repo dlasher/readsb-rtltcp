@@ -146,12 +146,6 @@ static void configSetDefaults(void) {
     Modes.acHashBits = AIRCRAFT_HASH_BITS;
     Modes.acBuckets = 1 << Modes.acHashBits; // this is critical for hashing purposes
 
-    // Initialize bucket-level locks for aircraft hash table
-    Modes.aircraftLocks = cmalloc(Modes.acBuckets * sizeof(pthread_mutex_t));
-    for (int i = 0; i < Modes.acBuckets; i++) {
-        pthread_mutex_init(&Modes.aircraftLocks[i], NULL);
-    }
-
     Modes.receiver_table_hash_bits = 6; // dynamically resized, start very small
 
     Modes.freq = MODES_DEFAULT_FREQ;
