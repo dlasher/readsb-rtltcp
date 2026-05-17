@@ -459,14 +459,9 @@ static void *rtltcp_read_thread(void *arg) {
             usleep(100000);
             continue;
 }
-        // Set socket timeout for non-blocking operation
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-        ssize_t received = recv(sock, (char*)RTLSDR.rtl_tcp_buffer, Modes.sdr_buf_size, 0);
+        ssize_t received = recv(sock, (char*)RTLSDR.rtl_tcp_buffer, Modes.sdr_buf_size, MSG_WAITALL);
         if (received <= 0) {
+            if (atomic_load(&Modes.exit)) break;
             pthread_mutex_lock(&Modes.sdrControlMutex);
             close(RTLSDR.rtl_tcp_socket);
             RTLSDR.rtl_tcp_socket = -1;
@@ -713,7 +708,10 @@ void rtlsdrRun() {
     if (RTLSDR.rtl_tcp_mode) {
         start_cpu_timing(&rtlsdr_thread_cpu);
         pthread_create(&RTLSDR.rtl_tcp_thread, NULL, rtltcp_read_thread, NULL);
-        // Remove the blocking pthread_join and make it non-blocking
+        // Block until the read thread exits (shutdown triggers recv failure,
+        // thread checks Modes.exit in reconnect loop and returns)
+        pthread_join(RTLSDR.rtl_tcp_thread, NULL);
+        RTLSDR.rtl_tcp_thread = 0;
         end_cpu_timing(&rtlsdr_thread_cpu, &Modes.reader_cpu_accumulator);
         return;
     }
