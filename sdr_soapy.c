@@ -462,7 +462,7 @@ void soapyRun()
     buf = malloc(buffer_elements * 4);
 
 
-    while (!Modes.exit) {
+    while (!atomic_load(&Modes.exit)) {
         int flags;
         long long timeNs;
 
@@ -517,7 +517,7 @@ void soapyRun()
             // make extra sure that the decode thread isn't sleeping
             wakeDecode();
 
-            if (--antiSpam <= 0 && !Modes.exit) {
+            if (--antiSpam <= 0 && !atomic_load(&Modes.exit)) {
                 fprintf(stderr, "FIFO dropped, suppressing this message for 30 seconds.\n");
                 antiSpam = 300;
             }

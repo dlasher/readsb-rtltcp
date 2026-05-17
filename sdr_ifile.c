@@ -185,7 +185,7 @@ void ifileRun() {
     clock_gettime(CLOCK_REALTIME, &ts);
 
     lockReader();
-    while (!Modes.exit && !eof) {
+    while (!atomic_load(&Modes.exit) && !eof) {
         ssize_t nread, toread;
         void *r;
         struct mag_buf *outbuf, *lastbuf;
@@ -261,7 +261,7 @@ void ifileRun() {
     }
 
     // Wait for the main thread to consume all data (reader still locked here)
-    while (!Modes.exit && Modes.first_filled_buffer != Modes.first_free_buffer) {
+    while (!atomic_load(&Modes.exit) && Modes.first_filled_buffer != Modes.first_free_buffer) {
         wakeDecode();
         threadTimedWait(&Threads.reader, &ts, 50);
     }

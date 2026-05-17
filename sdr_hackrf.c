@@ -276,7 +276,7 @@ void hackRFRun() {
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    while (!Modes.exit) {
+    while (!atomic_load(&Modes.exit)) {
         threadTimedWait(&Threads.reader, &ts, 50);
     }
 }

@@ -675,7 +675,7 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
         outbuf->dropped += slen;
         sampleCounter += slen;
         wakeDecode();
-        if (--antiSpam <= 0 && !Modes.exit) { fprintf(stderr, "FIFO dropped, suppressing this message for 30 seconds.\n"); antiSpam = 300; }
+        if (--antiSpam <= 0 && !atomic_load(&Modes.exit)) { fprintf(stderr, "FIFO dropped, suppressing this message for 30 seconds.\n"); antiSpam = 300; }
         return;
     }
     dropping = 0;
@@ -719,7 +719,7 @@ void rtlsdrRun() {
     }
     start_cpu_timing(&rtlsdr_thread_cpu);
     rtlsdr_read_async(RTLSDR.dev, rtlsdrCallback, NULL, MODES_RTL_BUFFERS, Modes.sdr_buf_size);
-    if (!Modes.exit) {
+    if (!atomic_load(&Modes.exit)) {
         fprintf(stderr,"FATAL: rtlsdr_read_async returned unexpectedly, probably lost the USB device, bailing out\n");
     }
 }

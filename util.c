@@ -293,7 +293,7 @@ void threadDestroyAll() {
 }
 void threadTimedWait(threadT *thread, struct timespec *ts, int64_t increment) {
     // don't wait when we want to exit
-    if (Modes.exit)
+    if (atomic_load(&Modes.exit))
         return;
     incTimedwait(ts, increment);
     int err = pthread_cond_timedwait(&thread->cond, &thread->mutex, ts);

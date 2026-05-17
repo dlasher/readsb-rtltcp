@@ -301,7 +301,7 @@ static void *handle_bladerf_samples(struct bladerf *dev,
     MODES_NOTUSED(num_samples);
 
     lockReader();
-    if (Modes.exit) {
+    if (atomic_load(&Modes.exit)) {
         unlockReader();
         return BLADERF_STREAM_SHUTDOWN;
     }

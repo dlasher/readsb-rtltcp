@@ -267,7 +267,7 @@ void plutosdrRun() {
     }
     start_cpu_timing(&thread_cpu);
 
-    while (!Modes.exit) {
+    while (!atomic_load(&Modes.exit)) {
         int16_t *p = PLUTOSDR.readbuf;
         uint32_t len = (uint32_t) iio_buffer_refill(PLUTOSDR.rxbuf) / 2;
         p_inc = iio_buffer_step(PLUTOSDR.rxbuf);

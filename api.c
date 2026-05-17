@@ -1952,7 +1952,7 @@ static void *apiThreadEntryPoint(void *arg) {
     struct timespec cpu_timer;
     start_cpu_timing(&cpu_timer);
     int64_t next_stats_sync = 0;
-    while (!Modes.exit) {
+    while (!atomic_load(&Modes.exit)) {
         if (count == maxEvents) {
             epollAllocEvents(&events, &maxEvents);
         }
@@ -2054,7 +2054,7 @@ static void *apiUpdateEntryPoint(void *arg) {
     clock_gettime(CLOCK_REALTIME, &ts);
     struct timespec cpu_timer;
 
-    while (!Modes.exit) {
+    while (!atomic_load(&Modes.exit)) {
 
         struct timespec watch;
 
@@ -2094,7 +2094,7 @@ static void *apiUpdateEntryPoint(void *arg) {
             threadTimedWait(&Threads.apiUpdate, &ts, remaining - elapsed);
             //fprintf(stderr, ".");
             elapsed = mstime() - waitStarted;
-        } while (!Modes.exit && elapsed < remaining);
+        } while (!atomic_load(&Modes.exit) && elapsed < remaining);
     }
     pthread_mutex_unlock(&Threads.apiUpdate.mutex);
     return NULL;
