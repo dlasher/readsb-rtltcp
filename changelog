@@ -1,3 +1,38 @@
+readsb (3.16.20) stable; urgency=medium
+
+  * security: Add network message length validation in readAscii hex/GPSD + decodeBinMessage
+  * security: Implement safe_atoi for range-validated SBS message type parsing
+  * security: Restore readsb.c function bodies lost in security commit regression
+  * security: Apply atomic_load/store consistently to all Modes.exit/exitSoon sites
+  * security: Initialize aircraft bucket locks in modesInit instead of destroy/cleanup
+  * rtl_tcp: Add persistent retry tracking across disconnect events (not per-event reset)
+  * rtl_tcp: Classify invalid dongle magic as permanent error (no retry, thread exits)
+  * audit: Complete lock hierarchy audit across 24 mutexes, 58 lock sites -- no violations
+  * audit: Complete linear search audit -- 11 full-table scans all legitimate batch ops
+  * build: Fix net_io.c compilation with proper includes and structural fixes
+  * build: Fix readsb.c compilation after security commit regression
+  * build: Docker build verified passing
+
+ -- Automated Security Fix <security@example.com>  Sat, 16 May 2026 23:45:00 +0000
+
+readsb (3.16.19) stable; urgency=medium
+
+  * Add Priority 1 task list for next phase of security improvements
+
+ -- Automated Security Fix <security@example.com>  Sat, 16 May 2026 18:01:00 +0000
+
+readsb (3.16.18) stable; urgency=medium
+
+  * Fix duplicate cleanup code in sdr_rtlsdr.c
+
+ -- Automated Security Fix <security@example.com>  Sat, 16 May 2026 13:45:00 +0000
+
+readsb (3.16.17) stable; urgency=medium
+
+  * security: Complete Phase 1 memory safety fixes - buffer overflows and format string vulnerabilities
+
+ -- Automated Security Fix <security@example.com>  Sat, 16 May 2026 13:30:00 +0000
+
 readsb (3.16.16) stable; urgency=medium
 
   * security-fixes: Implement per-bucket locking for aircraft hash table to prevent race conditions

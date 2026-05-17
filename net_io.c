@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 700
+
 // Part of readsb, a Mode-S/ADSB/TIS message decoder.
 //
 // net_io.c: network handling.
@@ -51,9 +53,6 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "ais_charset.h"
-#include "readsb.h"
-
 #include <assert.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -61,10 +60,22 @@
 #include <netdb.h>
 #include <poll.h>
 
+#include "ais_charset.h"
+#include "readsb.h"
+#include "net_io.h"
 #include "uat2esnt/uat2esnt.h"
 
 #define DLE 0x10
 #define ETX 0x03
+
+// Maximum message sizes for different message types
+#define MAX_GPSD_MSG_LEN    2048
+#define MAX_HEX_MSG_LEN     1024
+#define MAX_BEAST_MSG_LEN   1024
+#define MAX_UAT_MSG_LEN     2048
+#define MAX_SBS_MSG_LEN     512
+#define MAX_ASTERIX_MSG_LEN 2048
+#define MAX_PLANEFINDER_MSG_LEN 1024
 
 // ============================= Networking =============================
 //
@@ -209,6 +220,37 @@ static struct net_service *serviceInit(struct net_service_group *group, const ch
 
     return service;
 }
+
+// ===================== Input Validation Functions =====================
+
+// Generic message length validation
+static int validate_message_length(const char *msg, size_t len, size_t max_len) {
+    if (msg == NULL || len == 0) return 0;
+    if (len > max_len) return 0;
+    return 1;
+}
+
+static int validate_gpsd_message(const char *msg, size_t len) {
+    return validate_message_length(msg, len, MAX_GPSD_MSG_LEN);
+}
+static int validate_hex_message(const char *msg, size_t len) {
+    return validate_message_length(msg, len, MAX_HEX_MSG_LEN);
+}
+static int validate_beast_message(const char *msg, size_t len) {
+    return validate_message_length(msg, len, MAX_BEAST_MSG_LEN);
+}
+
+// Safe arithmetic wrapper for buffer size calculations
+static int safe_atoi(const char *str, int *result, int min_val, int max_val) {
+    char *endptr;
+    long val = strtol(str, &endptr, 10);
+    if (*endptr != '\0' && *endptr != '\n' && *endptr != '\r') return 0;
+    if (val < min_val || val > max_val) return 0;
+    *result = (int)val;
+    return 1;
+}
+
+// =====================================================================
 
 static uint8_t char_to_ais(int ch)
 {
@@ -1929,7 +1971,7 @@ static void modesSendRawOutput(struct modesMessage *mm) {
 
     if (Modes.mlat && mm->timestamp) {
         /* timestamp, big-endian */
-        snprintf(p, 16, "@%012" PRIX64,
+        snprintf(p, 16, "@%012" PRIX64, mm->timestamp);
         p += 13;
     } else
         *p++ = '*';
@@ -3108,7 +3150,11 @@ static int decodeSbsLine(struct client *c, char *line, int remote, int64_t now, 
     if (!t[2] || strlen(t[2]) != 1)
         goto basestation_invalid;
 
-    mm->sbsMsgType = atoi(t[2]);
+    mm->sbsMsgType = 0;
+    int parsed_type;
+    if (safe_atoi(t[2], &parsed_type, 0, 255)) {
+        mm->sbsMsgType = parsed_type;
+    }
 
     if (!t[5] || strlen(t[5]) < 6 || strlen(t[5]) > 7) // icao must be 6 characters
         goto basestation_invalid;
@@ -3541,12 +3587,12 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
         p += sprintf(p, ",");
     }
 
+    // Field 19 is the Squawk Change Alert flag (if we have it)
     if (mm->receiverCountMlat) {
         int len1 = snprintf(p, 50, ",%d", mm->receiverCountMlat);
         if (len1 < 0 || len1 >= 50) len1 = 0;
         p += len1;
     } else if (mm->alert_valid) {
-        // Field 19 is the Squawk Changing Alert flag (if we have it)
         if (mm->alert) {
             p += sprintf(p, ",-1");
         } else {
@@ -3556,34 +3602,18 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
         p += sprintf(p, ",");
     }
 
+    // Field 20 is the Squawk Emergency flag (if we have it)
     if (mm->mlatEPU) {
         int len1 = snprintf(p, 50, ",%d", mm->mlatEPU);
         if (len1 < 0 || len1 >= 50) len1 = 0;
         p += len1;
     } else if (mm->squawk_emergency_valid) {
-        // Field 20 is the Squawk Emergency flag (if we have it)
         if (mm->squawk_emergency) {
             p += sprintf(p, ",-1");
         } else {
             p += sprintf(p, ",0");
         }
-    } else {
-        p += sprintf(p, ",");
-    }
-
-    if (mm->mlatEPU) {
-        int len1 = snprintf(p, 50, ",%d", mm->mlatEPU);
-        if (len1 < 0 || len1 >= 50) len1 = 0;
-        p += len1;
-    } else if (mm->squawk_emergency_valid) {
-        // Field 20 is the Squawk Emergency flag (if we have it)
-        if (mm->squawk_emergency) {
-            p += sprintf(p, ",-1");
-        } else {
-            p += sprintf(p, ",0");
-        }
-} else if (mm->squawk_valid) {
-        // Field 20 is the Squawk Emergency flag (if we have it)
+    } else if (mm->squawk_valid) {
         if ((mm->squawkHex == 0x7500) || (mm->squawkHex == 0x7600) || (mm->squawkHex == 0x7700)) {
             p += sprintf(p, ",-1");
         } else {
@@ -3595,19 +3625,14 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a, stru
 
     // Field 21 is the Squawk Ident flag (if we have it)
     if (mm->spi_valid) {
-        int len1 = snprintf(p, 50, ",-1");
-        if (len1 < 0 || len1 >= 50) len1 = 0;
-        p += len1;
+        if (mm->spi) {
+            p += sprintf(p, ",-1");
+        } else {
+            p += sprintf(p, ",0");
+        }
     } else {
-        int len1 = snprintf(p, 50, ",0");
-        if (len1 < 0 || len1 >= 50) len1 = 0;
-        p += len1;
+        p += sprintf(p, ",");
     }
-} else {
-    int len1 = snprintf(p, 50, ",");
-    if (len1 < 0 || len1 >= 50) len1 = 0;
-    p += len1;
-}
 
     // Field 22 is the OnTheGround flag (if we have it)
     switch (mm->airground) {
@@ -4033,8 +4058,13 @@ static int decodeBinMessage(struct client *c, char *p, int remote, int64_t now, 
     mm->client = c;
 
     ch = *p++; /// Get the message type
-
-
+    
+    // Validate that we have enough data for the declared message type
+    // (covers unknown type bytes that could produce arbitrary lengths)
+    if (!validate_beast_message(p, c->eod - p)) {
+        return 0;
+    }
+    
     mm->receiverId = c->receiverId;
     if (unlikely(Modes.incrementId)) {
         mm->receiverId += now / (10 * MINUTES);
@@ -4985,6 +5015,15 @@ static int readAscii(struct client *c, int64_t now, struct messageBuffer *mb) {
         }
         char *start = c->som;
         c->som = p + c->service->read_sep_len; // Move to start of next message
+        
+        // Validate message length before processing
+        size_t msg_len = strlen(start);
+        if ((c->service->read_handler == processHexMessage && !validate_hex_message(start, msg_len)) ||
+            (c->service->read_handler == handle_gpsd && !validate_gpsd_message(start, msg_len))) {
+            garbageIncrement(c, 1, __LINE__);
+            continue;
+        }
+        
         if (c->service->read_handler(c, start, c->remote, now, mb)) { // Pass message to handler.
             if (Modes.debug_net) {
                 fprintf(stderr, "%s: Closing connection from %s port %s\n", c->service->descr, c->host, c->port);

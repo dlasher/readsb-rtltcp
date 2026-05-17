@@ -1675,9 +1675,6 @@ void ca_add (struct craftArray *ca, struct aircraft *a) {
         }
         pthread_mutex_unlock(&ca->write_mutex);
     }
-        }
-        pthread_mutex_unlock(&ca->write_mutex);
-    }
 
     int duplicate = 0;
     for (int i = 0; i < ca->len; i++) {

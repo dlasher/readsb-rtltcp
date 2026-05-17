@@ -331,7 +331,11 @@ static void rtltcp_send_config(int sock) {
         rtltcp_send_command(sock, RTLTCP_SET_BIAS_TEE, 1);
 }
 
-static bool rtltcp_do_connect(const char *host, int port) {
+// Return values for rtltcp_do_connect:
+//   0 = success
+//  -1 = transient failure (may succeed on retry)
+//  -2 = permanent failure (will never succeed, give up)
+static int rtltcp_do_connect(const char *host, int port) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
     struct addrinfo hints, *res, *res0;
@@ -344,7 +348,7 @@ static bool rtltcp_do_connect(const char *host, int port) {
     int ret = getaddrinfo(host, port_str, &hints, &res0);
     if (ret) {
         fprintf(stderr, "rtl_tcp: address lookup failed for %s: %s\n", host, gai_strerror(ret));
-        return false;
+        return -1;
     }
     int sock = -1;
     for (res = res0; res; res = res->ai_next) {
@@ -384,7 +388,7 @@ static bool rtltcp_do_connect(const char *host, int port) {
     freeaddrinfo(res0);
     if (sock < 0) {
         fprintf(stderr, "rtl_tcp: connection failed to %s:%d\n", host, port);
-        return false;
+        return -1;
     }
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -405,12 +409,12 @@ static bool rtltcp_do_connect(const char *host, int port) {
     if (received != (ssize_t)sizeof(info)) {
         fprintf(stderr, "rtl_tcp: failed to receive dongle info (got %zd bytes)\n", received);
         close(sock);
-        return false;
+        return -1;
     }
     if (strncmp(info.magic, "RTL0", 4) != 0) {
-        fprintf(stderr, "rtl_tcp: invalid dongle magic\n");
+        fprintf(stderr, "rtl_tcp: invalid dongle magic - not an rtl_tcp server?\n");
         close(sock);
-        return false;
+        return -2;
     }
     pthread_mutex_lock(&Modes.sdrControlMutex);
     RTLSDR.rtl_tcp_socket = sock;
@@ -421,7 +425,7 @@ static bool rtltcp_do_connect(const char *host, int port) {
     const char *tuner_name = (tuner_number <= 6) ? tuner_names[tuner_number] : "Invalid";
     fprintf(stderr, "rtl_tcp: connected to %s:%d (Tuner: %s, %u gain steps)\n",
             host, port, tuner_name, gain_count);
-    return true;
+    return 0;
 }
 
 static bool rtltcp_setup_gains(void) {
@@ -467,13 +471,15 @@ static void *rtltcp_read_thread(void *arg) {
             close(RTLSDR.rtl_tcp_socket);
             RTLSDR.rtl_tcp_socket = -1;
             pthread_mutex_unlock(&Modes.sdrControlMutex);
-            int reconnect_delay = 1;  // Start with 1 second delay
+            static int persistent_retry_count = 0;
+            static int persistent_reconnect_delay = 1;
             int max_reconnect_delay = 60;  // Maximum 60 second delay
-            int retry_count = 0;
-            int max_retries = 10;  // Maximum number of reconnection attempts before giving up
+            int max_retries = 10;  // Maximum reconnection attempts across all disconnect events
             
-while (!atomic_load(&Modes.exit) && retry_count < max_retries) {
-                retry_count++;
+            if (persistent_reconnect_delay <= 0) persistent_reconnect_delay = 1;  // reset if stale
+            
+            while (!atomic_load(&Modes.exit) && persistent_retry_count < max_retries) {
+                persistent_retry_count++;
                 
                 // Check circuit breaker state
                 if (RTLSDR.circuit_state == CIRCUIT_OPEN) {
@@ -486,21 +492,27 @@ while (!atomic_load(&Modes.exit) && retry_count < max_retries) {
                     }
                 }
                 
-                fprintf(stderr, "rtl_tcp: attempting to reconnect (attempt %d/%d)...\n", retry_count, max_retries);
-                if (rtltcp_do_connect(RTLSDR.rtl_tcp_host, RTLSDR.rtl_tcp_port)) {
+                fprintf(stderr, "rtl_tcp: attempting to reconnect (attempt %d/%d)...\n", persistent_retry_count, max_retries);
+                int do_connect_result = rtltcp_do_connect(RTLSDR.rtl_tcp_host, RTLSDR.rtl_tcp_port);
+                if (do_connect_result == 0) {
                     rtltcp_send_config(RTLSDR.rtl_tcp_socket);
                     fprintf(stderr, "rtl_tcp: reconnected successfully\n");
-                    // Reset circuit breaker on successful connection
+                    // Reset circuit breaker and persistent state on successful connection
                     RTLSDR.circuit_state = CIRCUIT_CLOSED;
                     RTLSDR.failure_count = 0;
+                    persistent_retry_count = 0;
+                    persistent_reconnect_delay = 1;
+                    break;
+                } else if (do_connect_result == -2) {
+                    fprintf(stderr, "rtl_tcp: cannot connect to server - invalid response, not an rtl_tcp server?\n");
                     break;
                 }
-                fprintf(stderr, "rtl_tcp: reconnect failed, retrying in %d seconds...\n", reconnect_delay);
-                sleep(reconnect_delay);
+                fprintf(stderr, "rtl_tcp: reconnect failed, retrying in %d seconds...\n", persistent_reconnect_delay);
+                sleep(persistent_reconnect_delay);
                 
                 // Exponential backoff with jitter: add randomization to prevent thundering herd
-                int jitter = rand() % (reconnect_delay / 2 + 1);  // Add up to 50% jitter
-                reconnect_delay = imin(reconnect_delay * 2, max_reconnect_delay) + jitter;
+                int jitter = rand() % (persistent_reconnect_delay / 2 + 1);  // Add up to 50% jitter
+                persistent_reconnect_delay = imin(persistent_reconnect_delay * 2, max_reconnect_delay) + jitter;
                 
                 // Update circuit breaker state based on failure
                 RTLSDR.failure_count++;
@@ -526,9 +538,13 @@ static bool rtlsdrOpenTcp(void) {
     RTLSDR.rtl_tcp_host = host;
     RTLSDR.rtl_tcp_port = port;
     fprintf(stderr, "rtl_tcp: connecting to server at %s:%d\n", host, port);
-    if (!rtltcp_do_connect(host, port)) {
+    int do_connect_result = rtltcp_do_connect(host, port);
+    if (do_connect_result != 0) {
         free(host);
         RTLSDR.rtl_tcp_host = NULL;
+        if (do_connect_result == -2) {
+            fprintf(stderr, "rtl_tcp: cannot connect to server - invalid response, not an rtl_tcp server?\n");
+        }
         return false;
     }
     rtltcp_send_config(RTLSDR.rtl_tcp_socket);

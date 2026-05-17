@@ -324,12 +324,9 @@ static void modesInit(void) {
     pthread_mutex_init(&Modes.aircraftCreateMutex, NULL);
 
     // Initialize bucket-level locks for aircraft hash table
-    if (Modes.aircraftLocks) {
-        for (int i = 0; i < Modes.acBuckets; i++) {
-            pthread_mutex_destroy(&Modes.aircraftLocks[i]);
-        }
-        free(Modes.aircraftLocks);
-        Modes.aircraftLocks = NULL;
+    Modes.aircraftLocks = cmalloc(Modes.acBuckets * sizeof(pthread_mutex_t));
+    for (int i = 0; i < Modes.acBuckets; i++) {
+        pthread_mutex_init(&Modes.aircraftLocks[i], NULL);
     }
 
 
@@ -613,7 +610,702 @@ static void *readerEntryPoint(void *arg) {
         if (!atomic_load(&Modes.exit))
             setExit(2); // unexpected exit
     } else {
-struct timespec ts;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+
+        pthread_mutex_lock(&Threads.reader.mutex);
+
+        while (!atomic_load(&Modes.exit)) {
+            threadTimedWait(&Threads.reader, &ts, 15 * SECONDS);
+        }
+        pthread_mutex_unlock(&Threads.reader.mutex);
+    }
+
+    sdrClose();
+
+    return NULL;
+}
+
+static void *jsonEntryPoint(void *arg) {
+    MODES_NOTUSED(arg);
+    srandom(get_seed());
+
+    // set this thread low priority
+    setLowestPriorityPthread();
+
+    int64_t next_history = mstime();
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    pthread_mutex_lock(&Threads.json.mutex);
+
+    threadpool_buffer_t pass_buffer = { 0 };
+    threadpool_buffer_t zstd_buffer = { 0 };
+
+    ZSTD_CCtx* cctx = NULL;
+    if (Modes.enable_zstd) {
+        //if (Modes.debug_zstd) { fprintf(stderr, "calling ZSTD_createCCtx()\n"); }
+        cctx = ZSTD_createCCtx();
+        //if (Modes.debug_zstd) { fprintf(stderr, "ZSTD_createCCtx() returned %p\n", cctx); }
+    }
+
+    while (!atomic_load(&Modes.exit)) {
+
+        struct timespec start_time;
+        start_cpu_timing(&start_time);
+
+        int64_t now = mstime();
+
+        // old direct creation, slower when creating json for an aircraft more than once
+        //struct char_buffer cb = generateAircraftJson(0);
+
+        if (Modes.onlyBin < 2) {
+            // new way: use the apiBuffer of json fragments
+            struct char_buffer cb = apiGenerateAircraftJson(&pass_buffer);
+            if (Modes.json_gzip) {
+                writeJsonToGzip(Modes.json_dir, "aircraft.json.gz", cb, 2);
+            }
+            writeJsonToFile(Modes.json_dir, "aircraft.json", cb);
+
+            if ((Modes.legacy_history || ((ALL_JSON) && Modes.onlyBin < 2)) && now >= next_history) {
+                char filebuf[PATH_MAX];
+
+                snprintf(filebuf, PATH_MAX, "history_%d.json", Modes.json_aircraft_history_next);
+                writeJsonToFile(Modes.json_dir, filebuf, cb);
+
+                if (!Modes.json_aircraft_history_full) {
+                    free(writeJsonToFile(Modes.json_dir, "receiver.json", generateReceiverJson()).buffer); // number of history entries changed
+                    if (Modes.json_aircraft_history_next == HISTORY_SIZE - 1)
+                        Modes.json_aircraft_history_full = 1;
+                }
+
+                Modes.json_aircraft_history_next = (Modes.json_aircraft_history_next + 1) % HISTORY_SIZE;
+                next_history = now + HISTORY_INTERVAL;
+            }
+        }
+
+        if (Modes.debug_recent) {
+            struct char_buffer cb = generateAircraftJson(1 * SECONDS);
+            writeJsonToFile(Modes.json_dir, "aircraft_recent.json", cb);
+            sfree(cb.buffer);
+        }
+
+        struct char_buffer cb3 = generateAircraftBin(&pass_buffer);
+
+        if (Modes.enableBinGz) {
+            writeJsonToGzip(Modes.json_dir, "aircraft.binCraft", cb3, 1);
+        }
+
+        //fprintf(stderr, "uncompressed size %ld\n", (long) cb3.len);
+        if (Modes.enable_zstd) {
+            writeJsonToFile(Modes.json_dir, "aircraft.binCraft.zst", generateZstd(cctx, &zstd_buffer, cb3, 1));
+        }
+
+        if (Modes.json_globe_index) {
+            struct char_buffer cb2 = generateGlobeBin(-1, 1, &pass_buffer);
+            if (Modes.enableBinGz) {
+                writeJsonToGzip(Modes.json_dir, "globeMil_42777.binCraft", cb2, 1);
+            }
+            if (Modes.enable_zstd) {
+                writeJsonToFile(Modes.json_dir, "globeMil_42777.binCraft.zst", ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            }
+        }
+
+        end_cpu_timing(&start_time, &Modes.stats_current.aircraft_json_cpu);
+
+        //fprintTimePrecise(stderr, mstime());
+        //fprintf(stderr, " wrote --write-json-every stuff to --write-json \n");
+
+        // we should exit this wait early due to a cond_signal from api.c
+        threadTimedWait(&Threads.json, &ts, Modes.json_interval * 3);
+    }
+
+    ZSTD_freeCCtx(cctx);
+    free_threadpool_buffer(&zstd_buffer);
+    free_threadpool_buffer(&pass_buffer);
+
+    pthread_mutex_unlock(&Threads.json.mutex);
+
+    return NULL;
+}
+
+static void *globeJsonEntryPoint(void *arg) {
+    MODES_NOTUSED(arg);
+    srandom(get_seed());
+
+    // set this thread low priority
+    setLowestPriorityPthread();
+
+    if (Modes.onlyBin > 0)
+        return NULL;
+
+    pthread_mutex_lock(&Threads.globeJson.mutex);
+
+    threadpool_buffer_t pass_buffer = { 0 };
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    while (!atomic_load(&Modes.exit)) {
+        struct timespec start_time;
+        start_cpu_timing(&start_time);
+
+        for (int j = 0; j <= Modes.json_globe_indexes_len; j++) {
+            int index = Modes.json_globe_indexes[j];
+
+            char filename[32];
+            snprintf(filename, 31, "globe_%04d.json", index);
+            struct char_buffer cb = apiGenerateGlobeJson(index, &pass_buffer);
+            writeJsonToGzip(Modes.json_dir, filename, cb, 1);
+        }
+
+        end_cpu_timing(&start_time, &Modes.stats_current.globe_json_cpu);
+
+        // we should exit this wait early due to a cond_signal from api.c
+        threadTimedWait(&Threads.globeJson, &ts, Modes.json_interval * 3);
+    }
+
+    free_threadpool_buffer(&pass_buffer);
+
+    pthread_mutex_unlock(&Threads.globeJson.mutex);
+    return NULL;
+}
+
+static void *globeBinEntryPoint(void *arg) {
+    MODES_NOTUSED(arg);
+    srandom(get_seed());
+
+    // set this thread low priority
+    setLowestPriorityPthread();
+
+    int part = 0;
+    int n_parts = 8; // power of 2
+
+    int64_t sleep_ms = Modes.json_interval / n_parts;
+
+    pthread_mutex_lock(&Threads.globeBin.mutex);
+
+    threadpool_buffer_t pass_buffer = { 0 };
+    threadpool_buffer_t zstd_buffer = { 0 };
+
+    ZSTD_CCtx* cctx = NULL;
+    if (Modes.enable_zstd) {
+        cctx = ZSTD_createCCtx();
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    while (!atomic_load(&Modes.exit)) {
+        char filename[32];
+        struct timespec start_time;
+        start_cpu_timing(&start_time);
+
+        for (int j = 0; j < Modes.json_globe_indexes_len; j++) {
+            if (j % n_parts != part)
+                continue;
+
+            int index = Modes.json_globe_indexes[j];
+
+            struct char_buffer cb2 = generateGlobeBin(index, 0, &pass_buffer);
+
+            if (Modes.enableBinGz) {
+                snprintf(filename, 31, "globe_%04d.binCraft", index);
+                writeJsonToGzip(Modes.json_dir, filename, cb2, 1);
+            }
+
+            if (Modes.enable_zstd) {
+                snprintf(filename, 31, "globe_%04d.binCraft.zst", index);
+                writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            }
+
+            struct char_buffer cb3 = generateGlobeBin(index, 1, &pass_buffer);
+
+            if (Modes.enableBinGz) {
+                snprintf(filename, 31, "globeMil_%04d.binCraft", index);
+                writeJsonToGzip(Modes.json_dir, filename, cb3, 1);
+            }
+
+            if (Modes.enable_zstd) {
+                snprintf(filename, 31, "globeMil_%04d.binCraft.zst", index);
+                writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb3, 1)));
+            }
+        }
+
+        part++;
+        part %= n_parts;
+        end_cpu_timing(&start_time, &Modes.stats_current.bin_cpu);
+
+        threadTimedWait(&Threads.globeBin, &ts, sleep_ms);
+    }
+
+    ZSTD_freeCCtx(cctx);
+    free_threadpool_buffer(&zstd_buffer);
+    free_threadpool_buffer(&pass_buffer);
+
+    pthread_mutex_unlock(&Threads.globeBin.mutex);
+
+    return NULL;
+}
+
+static void gainStatistics(struct mag_buf *buf) {
+    static uint64_t loudEvents;
+    static uint64_t noiseLowSamples;
+    static uint64_t noiseHighSamples;
+    static uint64_t totalSamples;
+    static int slowRise;
+    static int64_t nextRaiseAgc;
+    static float loudRebound;
+
+    loudEvents += buf->loudEvents;
+    noiseLowSamples += buf->noiseLowSamples;
+    noiseHighSamples += buf->noiseHighSamples;
+    totalSamples += buf->length;
+
+    double interval = 0.5;
+    double riseTime = 15;
+    double reboundTime = 1.5;
+
+    if (totalSamples < interval * Modes.sample_rate) {
+        return;
+    }
+
+    double noiseLowPercent = noiseLowSamples / (double) totalSamples * 100.0;
+    double noiseHighPercent = noiseHighSamples / (double) totalSamples * 100.0;
+
+    if (!Modes.autoGain) {
+        goto reset;
+    }
+
+    // 29 gain values for typical rtl-sdr
+    // allow startup to sweep entire range quickly, almost half it for double steps
+
+    int noiseLow = noiseLowPercent > 5; // too many samples < noiseLowThreshold
+    int noiseHigh = noiseHighPercent < 1; // too few samples < noiseHighThreshold
+    int loud = loudEvents > 0;
+    int veryLoud = loudEvents > 5;
+    if (loud || noiseHigh) {
+        Modes.lowerGain = 1;
+        if (veryLoud && !Modes.gainStartup) {
+            Modes.lowerGain = 2;
+        }
+        if (loud) {
+            loudRebound += Modes.lowerGain;
+        }
+    } else if (noiseLow) {
+        if (
+                Modes.gainStartup
+                || slowRise >= riseTime / interval
+                || (loudRebound > 1 && slowRise >= reboundTime / interval)
+           ) {
+            slowRise = 0;
+            Modes.increaseGain = 1;
+            if (loudRebound > 0) {
+                loudRebound *= 0.95f;
+                loudRebound -= Modes.increaseGain;
+            }
+        } else {
+            slowRise++;
+        }
+    }
+
+
+    if (Modes.increaseGain && Modes.gain == 496 && buf->sysTimestamp < nextRaiseAgc) {
+        goto reset;
+    }
+    if (Modes.increaseGain || Modes.lowerGain) {
+        if (Modes.gainStartup) {
+            Modes.lowerGain *= Modes.gainStartup;
+            Modes.increaseGain *= Modes.gainStartup;
+        }
+        char *reason = "";
+        if (veryLoud) {
+            reason = "decreasing gain, many strong signals found: ";
+        } else if (loud) {
+            reason = "decreasing gain, strong signal found:       ";
+        } else if (noiseHigh) {
+            reason = "decreasing gain, noise too high:            ";
+        } else if (noiseLow) {
+            reason = "increasing gain, noise too low:             ";
+        }
+        sdrSetGain(reason);
+        if (Modes.gain == MODES_RTL_AGC) {
+            // switching to AGC is only done every 30 seconds to avoid oscillations due to the large step
+            nextRaiseAgc = buf->sysTimestamp + 30 * SECONDS;
+        }
+        if (0) {
+            fprintf(stderr, "%s noiseLow: %5.2f %%  noiseHigh: %5.2f %%  loudEvents: %4lld\n", reason, noiseLowPercent, noiseHighPercent, (long long) loudEvents);
+        }
+    }
+
+reset:
+    Modes.gainStartup /= 2;
+    loudEvents = 0;
+    noiseLowSamples = 0;
+    noiseHighSamples = 0;
+    totalSamples = 0;
+}
+
+
+static void timingStatistics(struct mag_buf *buf) {
+    static int64_t last_ts;
+
+    int64_t elapsed_ts = buf->sysMicroseconds - last_ts;
+
+    // nominal time in us between two SDR callbacks
+    int64_t nominal = Modes.sdr_buf_samples * 1000LL * 1000LL / Modes.sample_rate;
+
+    int64_t jitter = elapsed_ts - nominal;
+    if (last_ts && Modes.log_usb_jitter && fabs((double)jitter) > Modes.log_usb_jitter) {
+        fprintf(stderr, "libusb callback jitter: %6.0f us\n", (double) jitter);
+    }
+
+    static int64_t last_sys;
+    if (last_sys || buf->sampleTimestamp * (1 / 12e6) > 10) {
+        static int64_t last_sample;
+        static int64_t interval;
+        int64_t nominal_interval = 30 * SECONDS * 1000;
+        if (!last_sys) {
+            last_sys = buf->sysMicroseconds;
+            last_sample = buf->sampleTimestamp;
+            interval = nominal_interval;
+        }
+        double elapsed_sys = buf->sysMicroseconds - last_sys;
+        // every 30 seconds
+        if ((elapsed_sys > interval && fabs((double) jitter) < 100) || elapsed_sys > interval * 3 / 2) {
+            // adjust interval heuristically
+            interval += (nominal_interval - elapsed_sys) / 4;
+            double elapsed_sample = buf->sampleTimestamp - last_sample;
+            double freq_ratio = elapsed_sample / (elapsed_sys * 12.0);
+            double diff_us = elapsed_sample / 12.0 - elapsed_sys;
+            double ppm = (freq_ratio - 1) * 1e6;
+            Modes.estimated_ppm = ppm;
+            if (Modes.devel_log_ppm && fabs(ppm) > Modes.devel_log_ppm) {
+                fprintf(stderr, "SDR ppm: %8.1f elapsed: %6.0f ms diff: %6.0f us last jitter: %6.0f\n", ppm, elapsed_sys / 1000.0, diff_us, (double) jitter);
+            }
+            if (fabs(ppm) > 600) {
+                if (ppm < -1000) {
+                    int packets_lost = (int) nearbyint(ppm / -1820);
+                    Modes.stats_current.samples_lost += packets_lost * Modes.sdr_buf_samples;
+                    fprintf(stderr, "Lost %d packets (%.1f us) on USB, MLAT could be UNSTABLE, check sync! (ppm: %.0f)"
+                            "(or the system clock jumped for some reason)\n", packets_lost, diff_us, ppm);
+                } else {
+                    fprintf(stderr, "SDR ppm out of specification (could cause MLAT issues) or local clock jumped / not syncing with ntp or chrony! ppm: %.0f\n", ppm);
+                }
+            }
+            last_sys = buf->sysMicroseconds;
+            last_sample = buf->sampleTimestamp;
+        }
+    }
+
+    last_ts = buf->sysMicroseconds;
+}
+
+static void *decodeEntryPoint(void *arg) {
+
+    MODES_NOTUSED(arg);
+    srandom(get_seed());
+
+    pthread_mutex_lock(&Threads.decode.mutex);
+
+    modesInitNet();
+
+    /* If the user specifies --net-only, just run in order to serve network
+     * clients without reading data from the RTL device.
+     * This rules also in case a local Mode-S Beast is connected via USB.
+     */
+
+    //fprintf(stderr, "startup complete after %.3f seconds.\n", getUptime() / 1000.0);
+
+    interactiveInit();
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t now = mstime();
+    if (Modes.net_only) {
+        while (!atomic_load(&Modes.exit)) {
+            struct timespec start_time;
+
+            // give priorityTasks a chance to get the decode lock if necessary
+            if (priorityTasksPending()) {
+                pthread_cond_signal(&Threads.upkeep.cond);
+                threadTimedWait(&Threads.decode, &ts, 1);
+            }
+            start_cpu_timing(&start_time);
+
+            // sleep via epoll_wait in net_periodic_work
+            now = mstime();
+            backgroundTasks(now);
+
+            end_cpu_timing(&start_time, &Modes.stats_current.background_cpu);
+        }
+    } else {
+
+        int watchdogCounter = 200; // roughly 20 seconds
+
+        while (!atomic_load(&Modes.exit)) {
+            struct timespec start_time;
+
+            lockReader();
+            // reader is locked, and possibly we have data.
+            // copy out reader CPU time and reset it
+            add_timespecs(&Modes.reader_cpu_accumulator, &Modes.stats_current.reader_cpu, &Modes.stats_current.reader_cpu);
+            Modes.reader_cpu_accumulator.tv_sec = 0;
+            Modes.reader_cpu_accumulator.tv_nsec = 0;
+
+            struct mag_buf *buf = NULL;
+            if (Modes.first_free_buffer != Modes.first_filled_buffer) {
+                // FIFO is not empty, process one buffer.
+                buf = &Modes.mag_buffers[Modes.first_filled_buffer];
+            } else {
+                buf = NULL;
+            }
+            unlockReader();
+
+            if (buf) {
+                start_cpu_timing(&start_time);
+                demodulate2400(buf);
+                if (Modes.mode_ac) {
+                    demodulate2400AC(buf);
+                }
+
+                gainStatistics(buf);
+                timingStatistics(buf);
+
+                Modes.stats_current.samples_lost += Modes.sdr_buf_samples - buf->length;
+                Modes.stats_current.samples_processed += buf->length;
+                Modes.stats_current.samples_dropped += buf->dropped;
+                end_cpu_timing(&start_time, &Modes.stats_current.demod_cpu);
+
+                // Mark the buffer we just processed as completed.
+                lockReader();
+                Modes.first_filled_buffer = (Modes.first_filled_buffer + 1) % MODES_MAG_BUFFERS;
+                pthread_cond_signal(&Threads.reader.cond);
+                unlockReader();
+
+                watchdogCounter = 100; // roughly 10 seconds
+            } else {
+                // Nothing to process this time around.
+                if (--watchdogCounter <= 0) {
+                    fprintf(stderr, "<3>SDR wedged, exiting! (check power supply / avoid using an USB extension / SDR might be defective)\n");
+                    setExit(2);
+                    break;
+                }
+            }
+            start_cpu_timing(&start_time);
+            now = mstime();
+            backgroundTasks(now);
+            end_cpu_timing(&start_time, &Modes.stats_current.background_cpu);
+
+            lockReader();
+            int newData = (Modes.first_free_buffer != Modes.first_filled_buffer);
+            unlockReader();
+
+            if (!newData) {
+                /* wait for more data.
+                 * we should be getting data every 50-60ms. wait for max 80 before we give up and do some background work.
+                 * this is fairly aggressive as all our network I/O runs out of the background work!
+                 */
+                threadTimedWait(&Threads.decode, &ts, 80);
+            }
+            if (priorityTasksPending()) {
+                if (Modes.synthetic_now) {
+                    // run priorityTasks directly when using synthetic_now
+                    pthread_mutex_unlock(&Threads.decode.mutex);
+                    priorityTasksRun();
+                    pthread_mutex_lock(&Threads.decode.mutex);
+                } else {
+                    // give priorityTasks a chance to get the decode lock if necessary
+                    pthread_cond_signal(&Threads.upkeep.cond);
+                    threadTimedWait(&Threads.decode, &ts, 1);
+                }
+            }
+        }
+        sdrCancel();
+    }
+
+    pthread_mutex_unlock(&Threads.decode.mutex);
+    return NULL;
+}
+
+static void traceWriteTask(void *arg, threadpool_threadbuffers_t *buffer_group) {
+    readsb_task_t *info = (readsb_task_t *) arg;
+
+    if (mono_milli_seconds() > Modes.traceWriteTimelimit) {
+        return;
+    }
+
+    struct aircraft *a;
+    // increment info->from to mark this part of the task as finshed
+    for (int j = info->from; j < info->to; j++, info->from++) {
+        for (a = Modes.aircraft[j]; a; a = a->next) {
+            if (Modes.triggerPastDayTraceWrite && a->trace_len > 0 && !a->initialTraceWriteDone) {
+                a->trace_writeCounter = 0xc0ffee;
+                a->trace_write |= (WRECENT | WMEM);
+            }
+            if (a->trace_write) {
+                int64_t before = mono_milli_seconds();
+                if (before > Modes.traceWriteTimelimit) {
+                    return;
+                }
+                traceWrite(a, buffer_group);
+                int64_t elapsed = mono_milli_seconds() - before;
+                if (elapsed > 4 * SECONDS) {
+                    fprintf(stderr, "<3>traceWrite() for %06x took %.1f s!\n", a->addr, elapsed / 1000.0);
+                }
+            }
+        }
+    }
+}
+
+
+static void writeTraces(int64_t mono) {
+    static int lastRunFinished;
+    static int part;
+    static int64_t lastCompletion;
+    static int64_t nextResetCycleDuration;
+    static int firstRunDone;
+
+    if (!Modes.tracePool) {
+        // reduce priority
+        int oldPrio = getpriority(PRIO_PROCESS, 0);
+        setpriority(PRIO_PROCESS, 0, oldPrio + 10);
+
+        Modes.tracePoolSize = imin(8, imax(1, Modes.num_procs * 3 / 4));
+        Modes.tracePool = threadpool_create(Modes.tracePoolSize, 4);
+        Modes.traceTasks = allocate_task_group(8 * Modes.tracePoolSize);
+        lastRunFinished = 1;
+        lastCompletion = mono;
+
+        // restore previous priority
+        setpriority(PRIO_PROCESS, 0, oldPrio);
+    }
+
+    int taskCount = Modes.traceTasks->task_count;
+    threadpool_task_t *tasks = Modes.traceTasks->tasks;
+    readsb_task_t *infos = Modes.traceTasks->infos;
+
+    // how long until we want to have checked every aircraft if a trace needs to be written
+    int completeTime = 4 * SECONDS;
+    // how many invocations we get in that timeframe
+    int invocations = imax(1, completeTime / PERIODIC_UPDATE);
+    // how many parts we want to split the complete workload into
+    int n_parts = taskCount * invocations;
+    int thread_section_len = Modes.acBuckets / n_parts;
+    int extra = Modes.acBuckets % n_parts;
+
+    // only assign new task if we finished the last set of tasks
+    if (lastRunFinished) {
+        for (int i = 0; i < taskCount; i++) {
+            int64_t elapsed = mono - lastCompletion;
+
+            if (elapsed > Modes.writeTracesActualDuration) {
+                nextResetCycleDuration = mono + 60 * SECONDS;
+                Modes.writeTracesActualDuration = elapsed;
+            }
+
+            if (part >= n_parts) {
+                part = 0;
+
+                if (mono > nextResetCycleDuration) {
+                    nextResetCycleDuration = mono + 60 * SECONDS;
+                    Modes.writeTracesActualDuration = elapsed;
+                }
+
+                if (Modes.triggerPastDayTraceWrite) {
+                    // deactivate after one sweep
+                    Modes.triggerPastDayTraceWrite = 0;
+                    fprintf(stderr, "Wrote live traces for aircraft active within the last 24 hours. This took %.1f seconds (roughly %.0f minutes).\n",
+                            elapsed / 1000.0, elapsed / (double) MINUTES);
+                }
+                if (!firstRunDone) {
+                    firstRunDone = 1;
+                    fprintf(stderr, "Wrote live traces for aircraft active within the last 15 minutes. This took %.1f seconds (roughly %.0f minutes).\n",
+                            elapsed / 1000.0, elapsed / (double) MINUTES);
+                    Modes.triggerPastDayTraceWrite = 1; // activated for one sweep
+                }
+
+                if (elapsed > 30 * SECONDS && getUptime() > 10 * MINUTES) {
+                    fprintf(stderr, "trace writing iteration took %.1f seconds (roughly %.0f minutes), live traces will lag behind (historic traces are fine), "
+                            "consider alloting more CPU cores or increasing json-trace-interval!\n",
+                            elapsed / 1000.0, elapsed / (double) MINUTES);
+                }
+
+                lastCompletion = mono;
+            }
+
+
+            threadpool_task_t *task = &tasks[i];
+            readsb_task_t *range = &infos[i];
+
+            int thread_start = part * thread_section_len + imin(extra, part);
+            int thread_end = thread_start + thread_section_len + (part < extra ? 1 : 0);
+
+            part++;
+
+            //fprintf(stderr, "%8d %8d %8d\n", thread_start, thread_end, Modes.acBuckets);
+
+            if (thread_end > Modes.acBuckets) {
+                thread_end = Modes.acBuckets;
+                fprintf(stderr, "check traceWriteTask distribution\n");
+            }
+
+            range->from = thread_start;
+            range->to = thread_end;
+
+            task->function = traceWriteTask;
+            task->argument = range;
+
+            if (part >= n_parts) {
+                if (thread_end != Modes.acBuckets || i != taskCount - 1) {
+                    fprintf(stderr, "check traceWriteTask distribution\n");
+                }
+            }
+        }
+    }
+
+    struct timespec before = threadpool_get_cumulative_thread_time(Modes.tracePool);
+    threadpool_run(Modes.tracePool, tasks, taskCount);
+    struct timespec after = threadpool_get_cumulative_thread_time(Modes.tracePool);
+    timespec_add_elapsed(&before, &after, &Modes.stats_current.trace_json_cpu);
+
+    lastRunFinished = 1;
+    for (int i = 0; i < taskCount; i++) {
+        readsb_task_t *range = &infos[i];
+        if (range->from != range->to) {
+            lastRunFinished = 0;
+        }
+    }
+
+    //fprintf(stderr, "n_parts %4d part %4d lastRunFinished %d\n", n_parts, part, lastRunFinished);
+
+    // reset allocated buffers every minute
+    static int64_t next_buffer_reset;
+    if (mono > next_buffer_reset) {
+        next_buffer_reset = mono + 1 * MINUTES;
+        threadpool_reset_buffers(Modes.tracePool);
+    }
+}
+
+static void *upkeepEntryPoint(void *arg) {
+    MODES_NOTUSED(arg);
+    srandom(get_seed());
+
+    pthread_mutex_lock(&Threads.upkeep.mutex);
+
+    Modes.lockThreads[Modes.lockThreadsCount++] = &Threads.misc;
+    Modes.lockThreads[Modes.lockThreadsCount++] = &Threads.apiUpdate;
+    Modes.lockThreads[Modes.lockThreadsCount++] = &Threads.globeJson;
+    Modes.lockThreads[Modes.lockThreadsCount++] = &Threads.globeBin;
+    Modes.lockThreads[Modes.lockThreadsCount++] = &Threads.json;
+    Modes.lockThreads[Modes.lockThreadsCount++] = &Threads.decode;
+
+    if (Modes.lockThreadsCount > LOCK_THREADS_MAX) {
+        fprintf(stderr, "FATAL: LOCK_THREADS_MAX insufficient!\n");
+        exit(1);
+    }
+
+    struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
 
     while (!atomic_load(&Modes.exit)) {
@@ -2573,25 +3265,25 @@ int main(int argc, char **argv) {
     startWatch(&Modes.hungTimer2);
     pthread_mutex_unlock(&Modes.hungTimerMutex);
 
-     struct timespec mainloopTimer;
-     startWatch(&mainloopTimer);
-     while (!atomic_load(&Modes.exit)) {
-         int64_t wait_time = 5 * SECONDS;
-         if (Modes.auto_exit) {
-             int64_t uptime = getUptime();
-             if (uptime + wait_time >= Modes.auto_exit) {
-                 wait_time = imax(1, Modes.auto_exit - uptime);
-             }
-             if (uptime >= Modes.auto_exit) {
-                 setExit(1);
-             }
-         }
-         #ifdef NO_EVENT_FD
-         wait_time = imin(wait_time, 100); // no event_fd, limit sleep to 100 ms
-         #endif
-         epoll_wait(mainEpfd, events, maxEvents, wait_time);
-         if (atomic_load(&Modes.exitSoon)) {
-             if (Modes.apiShutdownDelay) {
+    struct timespec mainloopTimer;
+    startWatch(&mainloopTimer);
+    while (!atomic_load(&Modes.exit)) {
+        int64_t wait_time = 5 * SECONDS;
+        if (Modes.auto_exit) {
+            int64_t uptime = getUptime();
+            if (uptime + wait_time >= Modes.auto_exit) {
+                wait_time = imax(1, Modes.auto_exit - uptime);
+            }
+            if (uptime >= Modes.auto_exit) {
+                setExit(1);
+            }
+        }
+        #ifdef NO_EVENT_FD
+        wait_time = imin(wait_time, 100); // no event_fd, limit sleep to 100 ms
+        #endif
+        epoll_wait(mainEpfd, events, maxEvents, wait_time);
+        if (atomic_load(&Modes.exitSoon)) {
+            if (Modes.apiShutdownDelay) {
                 // delay for graceful api shutdown
                 fprintf(stderr, "Waiting %.3f seconds (--api-shutdown-delay) ...\n", Modes.apiShutdownDelay / 1000.0);
                 msleep(Modes.apiShutdownDelay);
@@ -2671,7 +3363,7 @@ int main(int argc, char **argv) {
 
     threadSignalJoin(&Threads.decode);
 
-    if (Modes.exit < 2) {
+    if (atomic_load(&Modes.exit) < 2) {
         // force stats to be done, this must happen before network cleanup as it checks network stuff
         Modes.next_stats_update = 0;
         priorityTasksRun();
@@ -2728,7 +3420,7 @@ int main(int argc, char **argv) {
 
     {
         char *exitString = "Normal exit.";
-        if (Modes.exit != 1) {
+        if (atomic_load(&Modes.exit) != 1) {
             exitString = "Abnormal exit.";
         }
         int64_t uptime = getUptime();
@@ -2745,7 +3437,7 @@ int main(int argc, char **argv) {
                 exitString, days, hours, minutes, seconds);
     }
 
-    if (Modes.exit != 1) {
+    if (atomic_load(&Modes.exit) != 1) {
         cleanup_and_exit(1);
     }
     cleanup_and_exit(0);
