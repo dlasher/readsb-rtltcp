@@ -1,3 +1,17 @@
+readsb (3.16.21) stable; urgency=medium
+
+  * security: Apply atomic_load to ALL Modes.exit accesses across all SDR backends (14 sites in 7 files)
+  * security: Fix duplicate aircraftLocks allocation (memory leak in configSetDefaults + modesInit)
+  * security: Restore realloc temp-pointer pattern in globe_index.c and receiver.c (P0 regression)
+  * security: Remove duplicate Field 20 code and fix broken Field 21 SPI logic in SBS output
+  * security: Restore missing function bodies in readsb.c (jsonEntryPoint, globeJsonEntryPoint, globeBinEntryPoint)
+  * security: Restore missing snprintf argument in modesSendRawOutput (truncated call)
+  * security: Fix realloc failure return type in receiver.c (struct char_buffer return, not void)
+  * validation: Docker build + run test against rtl_tcp server passed
+  * build: All code compiles with -Werror, zero warnings
+
+ -- readsb Security Fix <root@devONE.server>  Sun, 17 May 2026 14:00:00 +0000
+
 readsb (3.16.20) stable; urgency=medium
 
   * security: Add network message length validation in readAscii hex/GPSD + decodeBinMessage
