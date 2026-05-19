@@ -5,10 +5,11 @@ readsb (3.16.22) stable; urgency=medium
   * bugfix: Fix mutex deadlock in rtltcp_do_connect — removed redundant sdrControlMutex
     lock inside function because sdrOpen() already holds it
   * bugfix: Fix mutex deadlock in rtlsdrSetGain for rtl_tcp mode — same redundant lock
+  * build: Fix Docker build failure on older glibc (2.36) — remove _XOPEN_SOURCE 700 from
+    net_io.c and switch from -std=c11 to -std=gnu11 for C11 strtol symbol compatibility
   * validation: 5-minute rtl_tcp streaming test passed (144M samples/min, 34K preambles/min,
     4.5% CPU, 0 samples dropped, 0 crashes, 0 watchdog trips)
-  * validation: Full strace analysis confirmed TCP connect, dongle info recv, and
-    MSG_WAITALL data streaming all behave correctly
+  * validation: Docker build with Dockerfile.rtl_tcp and Dockerfile.legacy both pass
   * build: All code compiles with -Werror, zero warnings
 
  -- readsb Security Fix <root@devONE.server>  Mon, 18 May 2026 23:45:00 +0000
