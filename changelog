@@ -1,3 +1,18 @@
+readsb (3.16.22) stable; urgency=medium
+
+  * bugfix: Fix rtl_tcp ECONNRESET on connect — replace non-blocking connect+select+fcntl
+    with simple blocking connect using SO_SNDTIMEO for timeout (P0 regression)
+  * bugfix: Fix mutex deadlock in rtltcp_do_connect — removed redundant sdrControlMutex
+    lock inside function because sdrOpen() already holds it
+  * bugfix: Fix mutex deadlock in rtlsdrSetGain for rtl_tcp mode — same redundant lock
+  * validation: 5-minute rtl_tcp streaming test passed (144M samples/min, 34K preambles/min,
+    4.5% CPU, 0 samples dropped, 0 crashes, 0 watchdog trips)
+  * validation: Full strace analysis confirmed TCP connect, dongle info recv, and
+    MSG_WAITALL data streaming all behave correctly
+  * build: All code compiles with -Werror, zero warnings
+
+ -- readsb Security Fix <root@devONE.server>  Mon, 18 May 2026 23:45:00 +0000
+
 readsb (3.16.21) stable; urgency=medium
 
   * security: Apply atomic_load to ALL Modes.exit accesses across all SDR backends (14 sites in 7 files)

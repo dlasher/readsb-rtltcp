@@ -181,21 +181,18 @@ static int getClosestGainIndex(int target) {
 
 void rtlsdrSetGain(char *reason) {
     if (RTLSDR.rtl_tcp_mode) {
-        int sock;
-        pthread_mutex_lock(&Modes.sdrControlMutex);
-        sock = RTLSDR.rtl_tcp_socket;
-        pthread_mutex_unlock(&Modes.sdrControlMutex);
-        if (sock < 0) return;
+        // Caller already holds sdrControlMutex (sdrOpen or sdrSetGain)
+        if (RTLSDR.rtl_tcp_socket < 0) return;
         if (Modes.gain < 0) Modes.gain = 0;
         if (Modes.gain == MODES_AUTO_GAIN || Modes.gain >= 520) {
             RTLSDR.tunerAgcEnabled = 1;
             if (!Modes.gainQuiet) fprintf(stderr, "%srtl_tcp: tuner gain set to automatic\n", reason);
-            rtltcp_send_command(sock, RTLTCP_SET_GAIN_MODE, 0);
+            rtltcp_send_command(RTLSDR.rtl_tcp_socket, RTLTCP_SET_GAIN_MODE, 0);
         } else {
             RTLSDR.tunerAgcEnabled = 0;
             if (!Modes.gainQuiet) fprintf(stderr, "%srtl_tcp: tuner gain set to %.1f dB\n", reason, Modes.gain / 10.0);
-            rtltcp_send_command(sock, RTLTCP_SET_GAIN_MODE, 1);
-            rtltcp_send_command(sock, RTLTCP_SET_GAIN, (unsigned int)Modes.gain);
+            rtltcp_send_command(RTLSDR.rtl_tcp_socket, RTLTCP_SET_GAIN_MODE, 1);
+            rtltcp_send_command(RTLSDR.rtl_tcp_socket, RTLTCP_SET_GAIN, (unsigned int)Modes.gain);
         }
         return;
     }
@@ -354,35 +351,14 @@ static int rtltcp_do_connect(const char *host, int port) {
     for (res = res0; res; res = res->ai_next) {
         sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (sock >= 0) {
-            // Set socket to non-blocking for connection timeout
-            int flags = fcntl(sock, F_GETFL, 0);
-            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-            
-            // Attempt connection
+            // Use simple blocking connect with TCP_NODELAY (same as original working code)
+            struct timeval tv = {10, 0};  // 10 second connect timeout
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             ret = connect(sock, res->ai_addr, res->ai_addrlen);
-            if (ret == -1 && errno != EINPROGRESS) {
-                close(sock);
-                sock = -1;
-                continue;
-            }
-            
-            // If connection in progress, wait for it with timeout
-            if (ret == -1) {
-                fd_set fdset;
-                FD_ZERO(&fdset);
-                FD_SET(sock, &fdset);
-                struct timeval tv = {5, 0}; // 5 second timeout
-                int result = select(sock + 1, NULL, &fdset, NULL, &tv);
-                if (result <= 0) {
-                    close(sock);
-                    sock = -1;
-                    continue;
-                }
-            }
-            
-            // Set socket back to blocking mode
-            fcntl(sock, F_SETFL, flags);
-            break;
+            if (ret == 0) break;
+            fprintf(stderr, "rtl_tcp: connect failed: %s\n", strerror(errno));
+            close(sock);
+            sock = -1;
         }
     }
     freeaddrinfo(res0);
@@ -390,19 +366,11 @@ static int rtltcp_do_connect(const char *host, int port) {
         fprintf(stderr, "rtl_tcp: connection failed to %s:%d\n", host, port);
         return -1;
     }
+    // Clear send timeout so it doesn't affect subsequent sends
+    struct timeval zero = {0, 0};
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    
-    // Enable TCP keepalive to detect dead peers
-    int keepalive = 1;
-    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-    
-    // Set socket timeout for detecting half-open connections
-    struct timeval timeout;
-    timeout.tv_sec = 10;  // 10 second timeout
-    timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     dongle_info_t info;
     ssize_t received = recv(sock, (char*)&info, sizeof(info), 0);
@@ -416,16 +384,15 @@ static int rtltcp_do_connect(const char *host, int port) {
         close(sock);
         return -2;
     }
-    pthread_mutex_lock(&Modes.sdrControlMutex);
-    RTLSDR.rtl_tcp_socket = sock;
-    pthread_mutex_unlock(&Modes.sdrControlMutex);
     uint32_t tuner_number = ntohl(info.tuner_type);
     uint32_t gain_count = ntohl(info.tuner_gain_count);
     const char *tuner_names[] = {"Unknown", "E4000", "FC0012", "FC0013", "FC2580", "R820T", "R828D"};
     const char *tuner_name = (tuner_number <= 6) ? tuner_names[tuner_number] : "Invalid";
     fprintf(stderr, "rtl_tcp: connected to %s:%d (Tuner: %s, %u gain steps)\n",
             host, port, tuner_name, gain_count);
-    return 0;
+    // Return the connected socket fd (> 0) on success.
+    // Caller must assign RTLSDR.rtl_tcp_socket under sdrControlMutex as appropriate.
+    return sock;
 }
 
 static bool rtltcp_setup_gains(void) {
@@ -488,8 +455,11 @@ static void *rtltcp_read_thread(void *arg) {
                 }
                 
                 fprintf(stderr, "rtl_tcp: attempting to reconnect (attempt %d/%d)...\n", persistent_retry_count, max_retries);
-                int do_connect_result = rtltcp_do_connect(RTLSDR.rtl_tcp_host, RTLSDR.rtl_tcp_port);
-                if (do_connect_result == 0) {
+                int tcp_fd = rtltcp_do_connect(RTLSDR.rtl_tcp_host, RTLSDR.rtl_tcp_port);
+                if (tcp_fd >= 0) {
+                    pthread_mutex_lock(&Modes.sdrControlMutex);
+                    RTLSDR.rtl_tcp_socket = tcp_fd;
+                    pthread_mutex_unlock(&Modes.sdrControlMutex);
                     rtltcp_send_config(RTLSDR.rtl_tcp_socket);
                     fprintf(stderr, "rtl_tcp: reconnected successfully\n");
                     // Reset circuit breaker and persistent state on successful connection
@@ -498,7 +468,7 @@ static void *rtltcp_read_thread(void *arg) {
                     persistent_retry_count = 0;
                     persistent_reconnect_delay = 1;
                     break;
-                } else if (do_connect_result == -2) {
+                } else if (tcp_fd == -2) {
                     fprintf(stderr, "rtl_tcp: cannot connect to server - invalid response, not an rtl_tcp server?\n");
                     break;
                 }
@@ -533,15 +503,17 @@ static bool rtlsdrOpenTcp(void) {
     RTLSDR.rtl_tcp_host = host;
     RTLSDR.rtl_tcp_port = port;
     fprintf(stderr, "rtl_tcp: connecting to server at %s:%d\n", host, port);
-    int do_connect_result = rtltcp_do_connect(host, port);
-    if (do_connect_result != 0) {
+    int tcp_fd = rtltcp_do_connect(host, port);
+    if (tcp_fd < 0) {
         free(host);
         RTLSDR.rtl_tcp_host = NULL;
-        if (do_connect_result == -2) {
+        if (tcp_fd == -2) {
             fprintf(stderr, "rtl_tcp: cannot connect to server - invalid response, not an rtl_tcp server?\n");
         }
         return false;
     }
+    // sdrOpen() already holds sdrControlMutex, assign the fd
+    RTLSDR.rtl_tcp_socket = tcp_fd;
     rtltcp_send_config(RTLSDR.rtl_tcp_socket);
     RTLSDR.rtl_tcp_mode = true;
     RTLSDR.dev = NULL;
