@@ -21,7 +21,7 @@ WITH_UUIDS ?= no
 # aircraft.json and other json output
 PRINT_UUIDS ?= no
 
-DIALECT = -std=gnu11
+DIALECT = -std=gnu17
 CFLAGS = $(DIALECT) -W -Wall -Werror -fno-common -O2
 CFLAGS += -DMODES_READSB_VERSION=\"$(READSB_VERSION)\"
 CFLAGS += -DREADSB_SHORT_VERSION=\"$(shell cat version)\"
