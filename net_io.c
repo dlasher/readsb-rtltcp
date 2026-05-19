@@ -1,5 +1,3 @@
-#define _XOPEN_SOURCE 700
-
 // Part of readsb, a Mode-S/ADSB/TIS message decoder.
 //
 // net_io.c: network handling.
