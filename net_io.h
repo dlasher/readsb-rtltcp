@@ -113,6 +113,7 @@ struct client
     int8_t dropHalfDrop;
     int64_t dropHalfUntil;
     char *sendq;  // Write buffer - allocated later
+    int sendq_offset; // bytes already sent from start of sendq (lazy shift)
     int sendq_len; // Amount of data in SendQ
     int sendq_max; // Max size of SendQ
     uint32_t ping; // only 24 bit are ever sent
@@ -239,6 +240,7 @@ typedef union __packed {
 
 void netUseMessage(struct modesMessage *mm);
 void netDrainMessageBuffers();
+void netDrainBuffer(struct messageBuffer *buf);
 struct modesMessage *netGetMM(struct messageBuffer *buf);
 
 #endif

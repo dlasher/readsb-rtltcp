@@ -261,7 +261,7 @@ static void score_phase(int try_phase, uint16_t *pa, unsigned char **bestmsg, in
 // Given 'mlen' magnitude samples in 'm', sampled at 2.4MHz,
 // try to demodulate some Mode S messages.
 //
-void demodulate2400(struct mag_buf *mag) {
+void demodulate2400(struct mag_buf *mag, struct messageBuffer *mm_buf) {
     unsigned char msg1[MODES_LONG_MSG_BYTES], msg2[MODES_LONG_MSG_BYTES], *msg;
 
     unsigned char *bestmsg = NULL;
@@ -420,7 +420,7 @@ after_pre:
 
         msglen = modesMessageLenByType(getbits(bestmsg, 1, 5));
 
-        struct modesMessage *mm = netGetMM(&Modes.netMessageBuffer[0]);
+        struct modesMessage *mm = netGetMM(mm_buf);
 
         // For consistency with how the Beast / Radarcape does it,
         // we report the timestamp at the end of bit 56 (even if
@@ -504,101 +504,10 @@ after_pre:
         Modes.stats_current.noise_power_count += mag->length;
     }
 
-    netDrainMessageBuffers();
+    netDrainBuffer(mm_buf);
 }
 
-
-#ifdef MODEAC_DEBUG
-
-static int yscale(unsigned signal) {
-    return (int) (299 - 299.0 * signal / 65536.0);
-}
-
-static void draw_modeac(uint16_t *m, unsigned modeac, unsigned f1_clock, unsigned noise_threshold, unsigned signal_threshold, unsigned bits, unsigned noisy_bits, unsigned uncertain_bits) {
-    // 25 bits at 87*60MHz
-    // use 1 pixel = 30MHz = 1087 pixels
-
-    gdImagePtr im = gdImageCreate(1088, 300);
-    int red = gdImageColorAllocate(im, 255, 0, 0);
-    int brightgreen = gdImageColorAllocate(im, 0, 255, 0);
-    int darkgreen = gdImageColorAllocate(im, 0, 180, 0);
-    int blue = gdImageColorAllocate(im, 0, 0, 255);
-    int grey = gdImageColorAllocate(im, 200, 200, 200);
-    int white = gdImageColorAllocate(im, 255, 255, 255);
-    int black = gdImageColorAllocate(im, 0, 0, 0);
-
-    gdImageFilledRectangle(im, 0, 0, 1087, 299, white);
-
-    // draw samples
-    for (unsigned pixel = 0; pixel < 1088; ++pixel) {
-        int clock_offset = (pixel - 150) * 2;
-        int bit = clock_offset / 87;
-        int sample = (f1_clock + clock_offset) / 25;
-        int bitoffset = clock_offset % 87;
-        int color;
-
-        if (sample < 0)
-            continue;
-
-        if (clock_offset < 0 || bit >= 20) {
-            color = grey;
-        } else if (bitoffset < 27 && (uncertain_bits & (1 << (19 - bit)))) {
-            color = red;
-        } else if (bitoffset >= 27 && (noisy_bits & (1 << (19 - bit)))) {
-            color = red;
-        } else if (bitoffset >= 27) {
-            color = grey;
-        } else if (bits & (1 << (19 - bit))) {
-            color = brightgreen;
-        } else {
-            color = darkgreen;
-        }
-
-        gdImageLine(im, pixel, 299, pixel, yscale(m[sample]), color);
-    }
-
-    // draw bit boundaries
-    for (unsigned bit = 0; bit < 20; ++bit) {
-        unsigned clock = 87 * bit;
-        unsigned pixel0 = clock / 2 + 150;
-        unsigned pixel1 = (clock + 27) / 2 + 150;
-
-        gdImageLine(im, pixel0, 0, pixel0, 299, (bit == 0 || bit == 14) ? black : grey);
-        gdImageLine(im, pixel1, 0, pixel1, 299, (bit == 0 || bit == 14) ? black : grey);
-    }
-
-    // draw thresholds
-    gdImageLine(im, 0, yscale(noise_threshold), 1087, yscale(noise_threshold), blue);
-    gdImageLine(im, 0, yscale(signal_threshold), 1087, yscale(signal_threshold), blue);
-
-    // save it
-
-    static int file_counter;
-    char filename[PATH_MAX];
-    sprintf(filename, "modeac_%04X_%04d.png", modeac, ++file_counter);
-    fprintf(stderr, "writing %s\n", filename);
-
-    FILE *pngout = fopen(filename, "wb");
-    gdImagePng(im, pngout);
-    fclose(pngout);
-    gdImageDestroy(im);
-}
-
-#endif
-
-//////////
-////////// MODE A/C
-//////////
-
-// Mode A/C bits are 1.45us wide, consisting of 0.45us on and 1.0us off
-// We track this in terms of a (virtual) 60MHz clock, which is the lowest common multiple
-// of the bit frequency and the 2.4MHz sampling frequency
-//
-//            0.45us = 27 cycles }
-//            1.00us = 60 cycles } one bit period = 1.45us = 87 cycles
-//
-// one 2.4MHz sample = 25 cycles
-void demodulate2400AC(struct mag_buf *mag) {
+void demodulate2400AC(struct mag_buf *mag, struct messageBuffer *mm_buf) {
     uint16_t *m = mag->data;
     uint32_t mlen = mag->length;
     unsigned f1_sample;
@@ -765,7 +674,7 @@ void demodulate2400AC(struct mag_buf *mag) {
 #endif
 
         // This message looks good, submit it
-        struct modesMessage *mm = netGetMM(&Modes.netMessageBuffer[0]);
+        struct modesMessage *mm = netGetMM(mm_buf);
 
         // For consistency with how the Beast / Radarcape does it,
         // we report the timestamp at the second framing pulse (F2)
@@ -783,5 +692,5 @@ void demodulate2400AC(struct mag_buf *mag) {
         Modes.stats_current.demod_modeac++;
     }
 
-    netDrainMessageBuffers();
+    netDrainBuffer(mm_buf);
 }

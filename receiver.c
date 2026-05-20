@@ -17,22 +17,31 @@ struct receiver *receiverGet(uint64_t id) {
     if (!Modes.receiverTable) {
         return NULL;
     }
+    pthread_mutex_lock(&Modes.receiverMutex);
     struct receiver *r = Modes.receiverTable[receiverHash(id)];
-
     while (r && r->id != id) {
         r = r->next;
     }
+    pthread_mutex_unlock(&Modes.receiverMutex);
     return r;
 }
+
 struct receiver *receiverCreate(uint64_t id) {
     if (!Modes.receiverTable) {
         return NULL;
     }
-    struct receiver *r = receiverGet(id);
+    pthread_mutex_lock(&Modes.receiverMutex);
+    // check again under lock (receiverGet released the lock)
+    struct receiver *r = Modes.receiverTable[receiverHash(id)];
+    while (r && r->id != id) {
+        r = r->next;
+    }
     if (r) {
+        pthread_mutex_unlock(&Modes.receiverMutex);
         return r;
     }
     if (Modes.receiverCount > 2 * Modes.receiver_table_size) {
+        pthread_mutex_unlock(&Modes.receiverMutex);
         return NULL;
     }
     uint32_t hash = receiverHash(id);
@@ -54,6 +63,7 @@ struct receiver *receiverCreate(uint64_t id) {
 
     if (Modes.debug_receiver && Modes.receiverCount % 128 == 0)
         fprintf(stderr, "receiverCount: %"PRIu64"\n", Modes.receiverCount);
+    pthread_mutex_unlock(&Modes.receiverMutex);
     return r;
 }
 static void receiverDebugPrint(struct receiver *r, char *message) {
@@ -89,6 +99,7 @@ void receiverTimeout(int part, int nParts, int64_t now) {
     if (!Modes.receiverTable) {
         return;
     }
+    pthread_mutex_lock(&Modes.receiverMutex);
     int stride = Modes.receiver_table_size / nParts;
     int start = stride * part;
     int end = start + stride;
@@ -119,17 +130,25 @@ void receiverTimeout(int part, int nParts, int64_t now) {
             }
         }
     }
+    pthread_mutex_unlock(&Modes.receiverMutex);
 }
 void receiverInit() {
     Modes.receiver_table_size = 1 << Modes.receiver_table_hash_bits;
 
     Modes.receiverTable = cmalloc(Modes.receiver_table_size * sizeof(struct receiver *));
     memset(Modes.receiverTable, 0x0,  Modes.receiver_table_size * sizeof(struct receiver *));
+
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&Modes.receiverMutex, &attr);
+    pthread_mutexattr_destroy(&attr);
 }
 void receiverCleanup() {
     if (!Modes.receiverTable) {
         return;
     }
+    pthread_mutex_lock(&Modes.receiverMutex);
     for (int i = 0; i < Modes.receiver_table_size; i++) {
         struct receiver *r = Modes.receiverTable[i];
         struct receiver *next;
@@ -141,6 +160,8 @@ void receiverCleanup() {
     }
     sfree(Modes.receiverTable);
     Modes.receiverCount = 0;
+    pthread_mutex_unlock(&Modes.receiverMutex);
+    pthread_mutex_destroy(&Modes.receiverMutex);
 }
 int receiverPositionReceived(struct aircraft *a, struct modesMessage *mm, double lat, double lon, int64_t now) {
     uint64_t id = mm->receiverId;
@@ -148,6 +169,8 @@ int receiverPositionReceived(struct aircraft *a, struct modesMessage *mm, double
     if (id == 0 || lat > 85.0 || lat < -85.0 || lon < -179.9 || lon > 179.9) {
         return RECEIVER_RANGE_UNCLEAR;
     }
+    pthread_mutex_lock(&Modes.receiverMutex);
+
     int reliabilityRequired = Modes.position_persistence * 3 / 4;
     if (Modes.viewadsb || Modes.receiver_focus) {
         reliabilityRequired = imin(2, Modes.position_persistence);
@@ -162,10 +185,12 @@ int receiverPositionReceived(struct aircraft *a, struct modesMessage *mm, double
 
     if (!r || r->positionCounter == 0) {
         if (noModifyReceiver) {
+            pthread_mutex_unlock(&Modes.receiverMutex);
             return RECEIVER_RANGE_UNCLEAR;
         }
         r = receiverCreate(id);
         if (!r) {
+            pthread_mutex_unlock(&Modes.receiverMutex);
             return RECEIVER_RANGE_UNCLEAR;
         }
         r->lonMin = lon;
@@ -253,9 +278,11 @@ int receiverPositionReceived(struct aircraft *a, struct modesMessage *mm, double
     }
 
     if (distance > RECEIVER_MAX_RANGE) {
+        pthread_mutex_unlock(&Modes.receiverMutex);
         return RECEIVER_RANGE_BAD;
     }
 
+    pthread_mutex_unlock(&Modes.receiverMutex);
     return RECEIVER_RANGE_GOOD;
 }
 
@@ -263,6 +290,7 @@ struct receiver *receiverGetReference(uint64_t id, double *lat, double *lon, str
     if (!Modes.receiverTable) {
         return NULL;
     }
+    pthread_mutex_lock(&Modes.receiverMutex);
     struct receiver *r = receiverGet(id);
     if (!(Modes.debug_receiver && a && a->addr == Modes.cpr_focus)) {
         noDebug = 1;
@@ -271,6 +299,7 @@ struct receiver *receiverGetReference(uint64_t id, double *lat, double *lon, str
         if (!noDebug) {
             fprintf(stderr, "id:%016"PRIx64" NOREF: receiverId not known\n", id);
         }
+        pthread_mutex_unlock(&Modes.receiverMutex);
         return NULL;
     }
 
@@ -290,6 +319,7 @@ struct receiver *receiverGetReference(uint64_t id, double *lat, double *lon, str
                     r->latMin, r->latMax,
                     r->lonMin, r->lonMax);
         }
+        pthread_mutex_unlock(&Modes.receiverMutex);
         return NULL;
     }
 
@@ -301,6 +331,7 @@ struct receiver *receiverGetReference(uint64_t id, double *lat, double *lon, str
                 r->lonMin, r->lonMax);
     }
 
+    pthread_mutex_unlock(&Modes.receiverMutex);
     return r;
 }
 void receiverTest() {
@@ -325,17 +356,18 @@ void receiverTest() {
 }
 
 int receiverCheckBad(uint64_t id, int64_t now) {
+    pthread_mutex_lock(&Modes.receiverMutex);
     struct receiver *r = receiverGet(id);
-    if (r && now < r->timedOutUntil)
-        return 1;
-    else
-        return 0;
+    int ret = (r && now < r->timedOutUntil) ? 1 : 0;
+    pthread_mutex_unlock(&Modes.receiverMutex);
+    return ret;
 }
 
 struct receiver *receiverBad(uint64_t id, uint32_t addr, int64_t now) {
     if (!Modes.receiverTable) {
         return NULL;
     }
+    pthread_mutex_lock(&Modes.receiverMutex);
     struct receiver *r = receiverGet(id);
 
     if (!r)
@@ -358,8 +390,10 @@ struct receiver *receiverBad(uint64_t id, uint32_t addr, int64_t now) {
             r->goodCounter = 0;
             r->badCounter = 0;
         }
+        pthread_mutex_unlock(&Modes.receiverMutex);
         return r;
     } else {
+        pthread_mutex_unlock(&Modes.receiverMutex);
         return NULL;
     }
 }
@@ -379,6 +413,7 @@ struct char_buffer generateReceiversJson() {
     struct receiver *r;
 
     if (Modes.receiverTable) {
+        pthread_mutex_lock(&Modes.receiverMutex);
         for (int j = 0; j < Modes.receiver_table_size; j++) {
             for (r = Modes.receiverTable[j]; r; r = r->next) {
 
@@ -411,6 +446,7 @@ struct char_buffer generateReceiversJson() {
                     fprintf(stderr, "buffer overrun client json\n");
             }
         }
+        pthread_mutex_unlock(&Modes.receiverMutex);
     }
 
     if (*(p-2) == ',')

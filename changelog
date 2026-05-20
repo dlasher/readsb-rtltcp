@@ -1,3 +1,19 @@
+readsb (3.16.17) stable; urgency=medium
+
+  * performance: relaxed memory order in threadpool atomics
+  * performance: add CPU affinity pinning for decode thread
+  * performance: lazy sendq compaction (avoid O(n) memmove on partial sends)
+  * performance: receiver hash-table concurrency via recursive mutex
+  * performance: parallel demodulation via threadpool (--decode-threads=N)
+  * perf(test): test suites for affinity, threadpool, receiver, ring buffer,
+    sprint helpers, and AGC gain statistics
+  * fix: drainMessageBuffer lock safety for parallel worker contexts
+  * fix: accumulate per-chunk gain stats after parallel demod
+  * misc: add simple_drain flag to messageBuffer struct
+  * misc: expose netDrainBuffer() for single-buffer draining
+
+ -- dlasher <dlasher@users.noreply.github.com>  Wed, 20 May 2026 00:00:00 +0000
+
 readsb (3.16.16) stable; urgency=medium
 
   * rtl_tcp: add remote SDR client support (--net-rtltcp)

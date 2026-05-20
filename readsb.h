@@ -523,6 +523,21 @@ struct mag_buf
 #endif
 };
 
+// Accumulated gain statistics for AGC
+typedef struct {
+    uint64_t loudEvents;
+    uint64_t noiseLowSamples;
+    uint64_t noiseHighSamples;
+    uint64_t totalSamples;
+} gain_stats_t;
+
+// Persistent AGC state across gainStatistics calls
+typedef struct {
+    int slowRise;
+    int64_t nextRaiseAgc;
+    float loudRebound;
+} agc_state_t;
+
 // Program global state
 
 struct _Threads {
@@ -545,6 +560,7 @@ struct messageBuffer {
     int alloc;
     int id;
     struct client *activeClient;
+    bool simple_drain;
 };
 
 struct _Modes
@@ -956,6 +972,8 @@ struct _Modes
     int8_t staleStop;
 
     int8_t tcpBuffersAuto;
+
+    pthread_mutex_t receiverMutex; // protects receiver hash table
 
     struct timespec reader_cpu_accumulator; // CPU time used by the reader thread, copied out and reset by the main thread under the mutex
     ALIGNED struct mag_buf mag_buffers[MODES_MAG_BUFFERS]; // Converted magnitude buffers from RTL or file input

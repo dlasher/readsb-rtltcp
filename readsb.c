@@ -837,31 +837,27 @@ static void *globeBinEntryPoint(void *arg) {
 }
 
 static void gainStatistics(struct mag_buf *buf) {
-    static uint64_t loudEvents;
-    static uint64_t noiseLowSamples;
-    static uint64_t noiseHighSamples;
-    static uint64_t totalSamples;
-    static int slowRise;
-    static int64_t nextRaiseAgc;
-    static float loudRebound;
+    static gain_stats_t acc;
+    static agc_state_t agc;
 
-    loudEvents += buf->loudEvents;
-    noiseLowSamples += buf->noiseLowSamples;
-    noiseHighSamples += buf->noiseHighSamples;
-    totalSamples += buf->length;
+    acc.loudEvents += buf->loudEvents;
+    acc.noiseLowSamples += buf->noiseLowSamples;
+    acc.noiseHighSamples += buf->noiseHighSamples;
+    acc.totalSamples += buf->length;
 
     double interval = 0.5;
     double riseTime = 15;
     double reboundTime = 1.5;
 
-    if (totalSamples < interval * Modes.sample_rate) {
+    if (acc.totalSamples < interval * Modes.sample_rate) {
         return;
     }
 
-    double noiseLowPercent = noiseLowSamples / (double) totalSamples * 100.0;
-    double noiseHighPercent = noiseHighSamples / (double) totalSamples * 100.0;
+    double noiseLowPercent = acc.noiseLowSamples / (double) acc.totalSamples * 100.0;
+    double noiseHighPercent = acc.noiseHighSamples / (double) acc.totalSamples * 100.0;
 
     if (!Modes.autoGain) {
+        memset(&agc, 0, sizeof(agc));
         goto reset;
     }
 
@@ -870,35 +866,38 @@ static void gainStatistics(struct mag_buf *buf) {
 
     int noiseLow = noiseLowPercent > 5; // too many samples < noiseLowThreshold
     int noiseHigh = noiseHighPercent < 1; // too few samples < noiseHighThreshold
-    int loud = loudEvents > 0;
-    int veryLoud = loudEvents > 5;
+    int loud = acc.loudEvents > 0;
+    int veryLoud = acc.loudEvents > 5;
     if (loud || noiseHigh) {
         Modes.lowerGain = 1;
         if (veryLoud && !Modes.gainStartup) {
             Modes.lowerGain = 2;
         }
         if (loud) {
-            loudRebound += Modes.lowerGain;
+            agc.loudRebound += Modes.lowerGain;
         }
     } else if (noiseLow) {
         if (
                 Modes.gainStartup
-                || slowRise >= riseTime / interval
-                || (loudRebound > 1 && slowRise >= reboundTime / interval)
+                || agc.slowRise >= riseTime / interval
+                || (agc.loudRebound > 1 && agc.slowRise >= reboundTime / interval)
            ) {
-            slowRise = 0;
+            agc.slowRise = 0;
             Modes.increaseGain = 1;
-            if (loudRebound > 0) {
-                loudRebound *= 0.95f;
-                loudRebound -= Modes.increaseGain;
+            if (agc.loudRebound > 0) {
+                agc.loudRebound *= 0.95f;
+                agc.loudRebound -= Modes.increaseGain;
             }
         } else {
-            slowRise++;
+            agc.slowRise++;
         }
+    } else {
+        agc.loudRebound *= 0.97f;
+        if (agc.loudRebound < 0)
+            agc.loudRebound = 0;
     }
 
-
-    if (Modes.increaseGain && Modes.gain == 496 && buf->sysTimestamp < nextRaiseAgc) {
+    if (Modes.increaseGain && Modes.gain == 496 && buf->sysTimestamp < agc.nextRaiseAgc) {
         goto reset;
     }
     if (Modes.increaseGain || Modes.lowerGain) {
@@ -919,19 +918,16 @@ static void gainStatistics(struct mag_buf *buf) {
         sdrSetGain(reason);
         if (Modes.gain == MODES_RTL_AGC) {
             // switching to AGC is only done every 30 seconds to avoid oscillations due to the large step
-            nextRaiseAgc = buf->sysTimestamp + 30 * SECONDS;
+            agc.nextRaiseAgc = buf->sysTimestamp + 30 * SECONDS;
         }
         if (0) {
-            fprintf(stderr, "%s noiseLow: %5.2f %%  noiseHigh: %5.2f %%  loudEvents: %4lld\n", reason, noiseLowPercent, noiseHighPercent, (long long) loudEvents);
+            fprintf(stderr, "%s noiseLow: %5.2f %%  noiseHigh: %5.2f %%  loudEvents: %4lld\n", reason, noiseLowPercent, noiseHighPercent, (long long) acc.loudEvents);
         }
     }
 
 reset:
     Modes.gainStartup /= 2;
-    loudEvents = 0;
-    noiseLowSamples = 0;
-    noiseHighSamples = 0;
-    totalSamples = 0;
+    memset(&acc, 0, sizeof(acc));
 }
 
 
@@ -987,6 +983,73 @@ static void timingStatistics(struct mag_buf *buf) {
     }
 
     last_ts = buf->sysMicroseconds;
+}
+
+typedef struct {
+    struct mag_buf *mag;
+    struct messageBuffer *mm_buf;
+} parallel_demod_job_t;
+
+static void parallel_demod_worker(void *arg, threadpool_threadbuffers_t *tbuf) {
+    (void)tbuf;
+    parallel_demod_job_t *job = arg;
+    demodulate2400(job->mag, job->mm_buf);
+    if (Modes.mode_ac)
+        demodulate2400AC(job->mag, job->mm_buf);
+}
+
+static void parallelDemodulateBuffers(struct mag_buf *buf) {
+    int n = Modes.decodeThreads;
+    if (n <= 1) {
+        demodulate2400(buf, &Modes.netMessageBuffer[0]);
+        if (Modes.mode_ac)
+            demodulate2400AC(buf, &Modes.netMessageBuffer[0]);
+        return;
+    }
+
+    // NOTE: Stats counters (Modes.stats_current) updated inside demodulate2400
+    // are not synchronized across parallel workers. The parallel path is opt-in
+    // (--decode-threads=N, default 1), so approximate stats are acceptable.
+
+    struct mag_buf chunks[n];
+    parallel_demod_job_t jobs[n];
+    threadpool_task_t tasks[n];
+
+    uint32_t chunk_size = buf->length / n;
+
+    for (int i = 0; i < n; i++) {
+        uint32_t end = (i == n - 1) ? buf->length : (i + 1) * chunk_size;
+        uint32_t start = i * chunk_size;
+        uint32_t len = end - start;
+
+        chunks[i] = *buf;
+        chunks[i].data = buf->data + start;
+        chunks[i].length = len;
+        chunks[i].sampleTimestamp = buf->sampleTimestamp + (int64_t)start * 5;
+        chunks[i].sysTimestamp = buf->sysTimestamp + (int64_t)start * 5 / 12;
+        chunks[i].sysMicroseconds = chunks[i].sysTimestamp / 1000;
+        chunks[i].loudEvents = 0;
+        chunks[i].noiseLowSamples = 0;
+        chunks[i].noiseHighSamples = 0;
+
+        jobs[i].mag = &chunks[i];
+        jobs[i].mm_buf = &Modes.netMessageBuffer[i];
+        jobs[i].mm_buf->simple_drain = true;
+        tasks[i].function = parallel_demod_worker;
+        tasks[i].argument = &jobs[i];
+    }
+
+    threadpool_run(Modes.allPool, tasks, n);
+    netDrainMessageBuffers();
+
+    buf->loudEvents = 0;
+    buf->noiseLowSamples = 0;
+    buf->noiseHighSamples = 0;
+    for (int i = 0; i < n; i++) {
+        buf->loudEvents += chunks[i].loudEvents;
+        buf->noiseLowSamples += chunks[i].noiseLowSamples;
+        buf->noiseHighSamples += chunks[i].noiseHighSamples;
+    }
 }
 
 static void *decodeEntryPoint(void *arg) {
@@ -1052,10 +1115,7 @@ static void *decodeEntryPoint(void *arg) {
 
             if (buf) {
                 start_cpu_timing(&start_time);
-                demodulate2400(buf);
-                if (Modes.mode_ac) {
-                    demodulate2400AC(buf);
-                }
+                parallelDemodulateBuffers(buf);
 
                 gainStatistics(buf);
                 timingStatistics(buf);
@@ -3127,6 +3187,8 @@ int main(int argc, char **argv) {
     //log_with_timestamp("%s starting up.", MODES_READSB_VARIANT);
 
     modesInit();
+
+    threadAffinity(0); // Pin main thread to first available CPU
 
     receiverInit();
 

@@ -200,9 +200,9 @@ viewadsb: readsb
 	cp readsb viewadsb
 
 clean:
-	rm -f *.o uat2esnt/*.o compat/clock_gettime/*.o compat/clock_nanosleep/*.o compat/apple/*.o readsb viewadsb cprtests crctests convert_benchmark
+	rm -f *.o uat2esnt/*.o compat/clock_gettime/*.o compat/clock_nanosleep/*.o compat/apple/*.o readsb viewadsb cprtests crctests test_affinity test_threadpool test_receiver test_ringbuf test_sprint test_gainstats convert_benchmark
 
-test: cprtest crctest
+test: cprtest crctest affinitytest threadpooltest receivertest ringbuftest sprinttest gainstatstest
 
 cprtest: cprtests
 	./cprtests
@@ -215,6 +215,42 @@ cprtests: cpr.o cprtests.o
 
 crctests: crc.c crc.h
 	$(CC) $(CFLAGS) -DCRCDEBUG -o $@ $<
+
+affinitytest: test_affinity
+	./test_affinity
+
+test_affinity: test_affinity.c
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
+threadpooltest: test_threadpool
+	./test_threadpool
+
+test_threadpool: test_threadpool.c threadpool.o
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread -lzstd
+
+receivertest: test_receiver
+	./test_receiver
+
+test_receiver: test_receiver.c
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
+ringbuftest: test_ringbuf
+	./test_ringbuf
+
+test_ringbuf: test_ringbuf.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+sprinttest: test_sprint
+	./test_sprint
+
+test_sprint: test_sprint.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+gainstatstest: test_gainstats
+	./test_gainstats
+
+test_gainstats: test_gainstats.c
+	$(CC) $(CFLAGS) -o $@ $<
 
 benchmarks: oneoff/convert_benchmark
 	./convert_benchmark

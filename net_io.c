@@ -236,6 +236,10 @@ static int sendFiveHeartbeats(struct client *c, int64_t now) {
     int heartbeat_len = c->service->heartbeat_out.len;
 
     if (heartbeat_msg && c->sendq && c->sendq_len + repeats * heartbeat_len < c->sendq_max) {
+        if (c->sendq_offset > 0) {
+            memmove(c->sendq, c->sendq + c->sendq_offset, c->sendq_len);
+            c->sendq_offset = 0;
+        }
         for (int k = 0; k < repeats; k++) {
             memcpy(c->sendq + c->sendq_len, heartbeat_msg, heartbeat_len);
             c->sendq_len += heartbeat_len;
@@ -1523,10 +1527,11 @@ static int flushClient(struct client *c, int64_t now) {
     int toWrite = c->sendq_len;
 
     if (toWrite == 0) {
+        c->sendq_offset = 0;
         return 0;
     }
 
-    int bytesWritten = send(c->fd, c->sendq, toWrite, 0);
+    int bytesWritten = send(c->fd, c->sendq + c->sendq_offset, toWrite, 0);
     int err = errno;
 
     // If we get -1, it's only fatal if it's not EAGAIN/EWOULDBLOCK
@@ -1555,13 +1560,16 @@ static int flushClient(struct client *c, int64_t now) {
     }
     if (bytesWritten > 0) {
         Modes.stats_current.network_bytes_out += bytesWritten;
-        // Advance buffer
+        // Advance buffer using offset (avoids O(n) memmove on every partial send)
         toWrite -= bytesWritten;
         c->sendq_len -= bytesWritten;
+        c->sendq_offset += bytesWritten;
 
         c->last_send = now;	// If we wrote anything, update this.
-        if (toWrite > 0) {
-            memmove((void*)c->sendq, c->sendq + bytesWritten, toWrite);
+        // Compact only when offset becomes large, not on every partial write
+        if (c->sendq_len > 0 && c->sendq_offset >= c->sendq_max / 4) {
+            memmove((void*)c->sendq, c->sendq + c->sendq_offset, c->sendq_len);
+            c->sendq_offset = 0;
         }
     }
     if (toWrite > 0 && !(c->epollEvent.events & EPOLLOUT)) {
@@ -1616,6 +1624,12 @@ static void flushWrites(struct net_writer *writer) {
             }
 
             c->bytesFromWriter += writer->dataUsed;
+
+            // Compact buffer before appending if offset has grown
+            if (c->sendq_offset > 0) {
+                memmove(c->sendq, c->sendq + c->sendq_offset, c->sendq_len);
+                c->sendq_offset = 0;
+            }
 
             int bufferInsufficient = (c->sendq_len + writer->dataUsed > c->sendq_max);
 
@@ -6359,7 +6373,7 @@ static inline int skipMessage(struct modesMessage *mm) {
 
 static void drainMessageBuffer(struct messageBuffer *buf) {
     //fprintf(stderr, "drainMessageBuffer: %d\n", buf->len);
-    if (Modes.decodeThreads < 2) {
+    if (buf->simple_drain) {
         for (int k = 0; k < buf->len; k++) {
             struct modesMessage *mm = &buf->msg[k];
             if (skipMessage(mm)) {
@@ -6447,4 +6461,8 @@ void netDrainMessageBuffers() {
         struct messageBuffer *mb = &Modes.netMessageBuffer[kt];
         drainMessageBuffer(mb);
     }
+}
+
+void netDrainBuffer(struct messageBuffer *buf) {
+    drainMessageBuffer(buf);
 }

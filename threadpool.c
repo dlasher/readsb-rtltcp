@@ -89,9 +89,9 @@ threadpool_t *threadpool_create(uint32_t thread_count, uint32_t buffer_count)
     threadpool_t *pool = (threadpool_t *) malloc(sizeof(threadpool_t));
 
     pool->terminate = 0;
-    atomic_store(&pool->remaining_tasks, 0);
-    atomic_store(&pool->pending_count, 0);
-    atomic_store(&pool->tasks, (intptr_t) NULL);
+    atomic_store_explicit(&pool->remaining_tasks, 0, memory_order_relaxed);
+    atomic_store_explicit(&pool->pending_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&pool->tasks, (intptr_t) NULL, memory_order_relaxed);
     pool->thread_count = thread_count;
     pool->threads = (thread_t *) malloc(sizeof(thread_t) * thread_count);
 
@@ -135,12 +135,12 @@ void threadpool_destroy(threadpool_t *pool)
     pool->terminate = 1;
 
     pthread_mutex_lock(&pool->worker_lock);
-    atomic_store(&pool->remaining_tasks, 0);
+    atomic_store_explicit(&pool->remaining_tasks, 0, memory_order_relaxed);
     pthread_cond_broadcast(&pool->notify_worker);
     pthread_mutex_unlock(&pool->worker_lock);
 
     pthread_mutex_lock(&pool->master_lock);
-    atomic_store(&pool->pending_count, 0);
+    atomic_store_explicit(&pool->pending_count, 0, memory_order_relaxed);
     pthread_cond_broadcast(&pool->notify_master);
     pthread_mutex_unlock(&pool->master_lock);
 
@@ -172,18 +172,20 @@ void threadpool_run(threadpool_t *pool, threadpool_task_t* tasks, uint32_t count
     fprintf(stderr, "%p threadpool_run, threads: %4d tasks: %4d\n", pool, pool->thread_count, count);
     #endif
 
-    atomic_store(&pool->pending_count, count);
-    atomic_store(&pool->tasks, (intptr_t) tasks);
+    atomic_store_explicit(&pool->pending_count, count, memory_order_release);
+    atomic_store_explicit(&pool->tasks, (intptr_t) tasks, memory_order_release);
     // setting remaining_tasks means a thread could start doing work already
     // pending_count / tasks need to be in place, so this order is important
-    atomic_store(&pool->remaining_tasks, count);
+    // release ordering ensures: any thread that sees remaining_tasks via acquire
+    // will also see pending_count and tasks
+    atomic_store_explicit(&pool->remaining_tasks, count, memory_order_release);
 
     pthread_mutex_lock(&pool->worker_lock);
     pthread_cond_broadcast(&pool->notify_worker); // wake up sleeping worker threads after remaining_tasks has been set
     pthread_mutex_unlock(&pool->worker_lock);
 
     pthread_mutex_lock(&pool->master_lock);
-    while (atomic_load(&pool->pending_count) > 0 && !pool->terminate)
+    while (atomic_load_explicit(&pool->pending_count, memory_order_acquire) > 0 && !pool->terminate)
     {
         pthread_cond_wait(&pool->notify_master, &pool->master_lock);
     }
@@ -211,7 +213,7 @@ static void *threadpool_threadproc(void *arg)
 
     while (1)
     {
-        remaining_tasks = atomic_load(&pool->remaining_tasks);
+        remaining_tasks = atomic_load_explicit(&pool->remaining_tasks, memory_order_acquire);
 
         if (remaining_tasks <= 0)
         {
@@ -225,7 +227,7 @@ static void *threadpool_threadproc(void *arg)
             // re-check remaining_tasks inside worker_lock before sleeping
             // this makes lost wakeup impossible
             // (remaining_tasks is incremented BEFORE taking worker_lock to wake the workers)
-            remaining_tasks = atomic_load(&pool->remaining_tasks);
+            remaining_tasks = atomic_load_explicit(&pool->remaining_tasks, memory_order_relaxed);
             if (remaining_tasks <= 0)
             {
                 // update thread_time
@@ -250,7 +252,7 @@ static void *threadpool_threadproc(void *arg)
             continue;
         }
 
-        task_index = atomic_fetch_sub(&pool->remaining_tasks, 1) - 1;
+        task_index = atomic_fetch_sub_explicit(&pool->remaining_tasks, 1, memory_order_acq_rel) - 1;
 
         if (task_index < 0) {
             continue;
@@ -260,11 +262,11 @@ static void *threadpool_threadproc(void *arg)
         fprintf(stderr, "%p thread %d got task: %4d\n", pool, thread->index, task_index);
         #endif
 
-        threadpool_task_t* task = (threadpool_task_t*) atomic_load(&pool->tasks) + task_index;
+        threadpool_task_t* task = (threadpool_task_t*) atomic_load_explicit(&pool->tasks, memory_order_acquire) + task_index;
 
         task->function(task->argument, &thread->user_buffers);
 
-        int pending_count = atomic_fetch_sub(&pool->pending_count, 1) - 1;
+        int pending_count = atomic_fetch_sub_explicit(&pool->pending_count, 1, memory_order_acq_rel) - 1;
 
         if (pending_count == 0)
         {

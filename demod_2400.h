@@ -34,8 +34,9 @@
 #define PREAMBLE_THRESHOLD_MAX 400
 
 struct mag_buf;
+struct messageBuffer;
 
-void demodulate2400 (struct mag_buf *mag);
-void demodulate2400AC (struct mag_buf *mag);
+void demodulate2400 (struct mag_buf *mag, struct messageBuffer *mm_buf);
+void demodulate2400AC (struct mag_buf *mag, struct messageBuffer *mm_buf);
 
 #endif
