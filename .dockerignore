@@ -1,0 +1,15 @@
+.git/
+.gitignore
+.dockerignore
+*.o
+*.swp
+docs/
+debian/
+*.1
+*.7
+*.png
+*.svg
+*.patch
+COMPAT/
+oneoff/
+uat2esnt/

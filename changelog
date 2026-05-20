@@ -1,3 +1,15 @@
+readsb (3.16.16) stable; urgency=medium
+
+  * rtl_tcp: add remote SDR client support (--net-rtltcp)
+  * rtl_tcp: fix mutex deadlocks and MSG_WAITALL handling
+  * docker: multi-arch CI builds (linux/amd64 + linux/arm64)
+  * docker: add Dockerfile.rtl_tcp variant
+  * docker: add docker-entrypoint.sh for ENV-to-CLI-arg translation
+  * build: use -std=gnu11 for glibc 2.36 compatibility
+  * build: remove _XOPEN_SOURCE 700 from net_io.c
+
+ -- dlasher <dlasher@users.noreply.github.com>  Tue, 19 May 2026 00:00:00 +0000
+
 readsb (3.16) stable; urgency=medium
 
   * debian: cleanup package build / service file
