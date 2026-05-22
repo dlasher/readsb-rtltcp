@@ -16,3 +16,5 @@ test_receiver
 test_ringbuf
 test_sprint
 test_gainstats
+cprtests
+crctests
